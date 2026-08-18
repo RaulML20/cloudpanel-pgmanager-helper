@@ -1,0 +1,521 @@
+{# BEGIN cloudpanel-pgmanager-helper #}
+<script>
+/* Adds a PostgreSQL section without changing the native MariaDB markup. */
+(function () {
+  var pgManagerPort = '__PGMANAGER_HELPER_PORT__';
+  var pgManagerApiBase = 'https://' + window.location.hostname + ':' + pgManagerPort;
+
+  function getDomainNameFromPath() {
+    var segments = window.location.pathname.split('/').filter(Boolean);
+    var siteIndex = segments.indexOf('site');
+    if (siteIndex === -1 || !segments[siteIndex + 1]) return null;
+    try {
+      return decodeURIComponent(segments[siteIndex + 1]);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function api(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    if (options.body) options.headers = { 'Content-Type': 'application/json' };
+    return fetch(pgManagerApiBase + path, options).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload && payload.error ? payload.error : 'Request failed');
+        }
+        return payload;
+      });
+    });
+  }
+
+  function findMariaDbCard() {
+    var information = document.querySelector('.database-server-information');
+    return information ? information.closest('.card.card-table') : null;
+  }
+
+  function findMariaDbUsersCard() {
+    var cards = document.querySelectorAll('.site-content .card.card-table');
+    for (var index = 0; index < cards.length; index++) {
+      var addLink = cards[index].querySelector('.card-header a[href]');
+      if (addLink && (/database user/i.test(addLink.textContent || '') || /\/user(?:\/|$)/i.test(addLink.getAttribute('href') || ''))) {
+        return cards[index];
+      }
+      var headings = cards[index].querySelectorAll('thead th');
+      for (var headingIndex = 0; headingIndex < headings.length; headingIndex++) {
+        if (/phpmyadmin/i.test(headings[headingIndex].textContent || '')) return cards[index];
+      }
+    }
+    return null;
+  }
+
+  function renameMariaDbHeading(card) {
+    var heading = card.querySelector('.card-header > div');
+    if (!heading) return;
+
+    for (var index = 0; index < heading.childNodes.length; index++) {
+      var node = heading.childNodes[index];
+      if (node.nodeType === 3 && node.nodeValue.trim()) {
+        node.nodeValue = node.nodeValue.replace(/Databases/i, 'MariaDB Databases');
+        return;
+      }
+    }
+  }
+
+  function replaceFirstHeadingText(card, value) {
+    var heading = card && card.querySelector('.card-header > div');
+    if (!heading) return;
+    for (var index = 0; index < heading.childNodes.length; index++) {
+      var node = heading.childNodes[index];
+      if (node.nodeType === 3 && node.nodeValue.trim()) {
+        node.nodeValue = node.nodeValue.replace(node.nodeValue.trim(), value);
+        return;
+      }
+    }
+  }
+
+  function showPostgresError(card, message) {
+    var error = card.querySelector('.pgmanager-users-error');
+    if (!error) {
+      error = document.createElement('div');
+      error.className = 'alert alert-danger m-3 pgmanager-users-error';
+      card.insertBefore(error, card.children[1] || null);
+    }
+    error.textContent = message;
+  }
+
+  function appendTextCell(row, value, className) {
+    var cell = document.createElement('td');
+    if (className) cell.className = className;
+    cell.textContent = value;
+    row.appendChild(cell);
+  }
+
+  function renderMappingReport(dialog, report) {
+    var box = dialog.querySelector('.pgmanager-mapping-report');
+    box.replaceChildren();
+    if (!report) {
+      box.style.display = 'none';
+      return;
+    }
+    box.style.display = '';
+    box.className = 'alert pgmanager-mapping-report ' + (report.ok ? 'alert-success' : 'alert-danger');
+    var lines = [];
+    if (report.envPath) lines.push('Configuration file: ' + report.envPath);
+    if (report.ok) {
+      lines.push('Read from: ' + (report.source || '-'));
+      lines.push('Host: ' + report.host + ':' + report.port);
+      lines.push('User: ' + report.user);
+      lines.push('Database: ' + report.dbname);
+      lines.push('Password configured: ' + (report.passwordConfigured ? 'Yes' : 'No'));
+    } else {
+      lines.push(report.error || 'The connection could not be resolved.');
+    }
+    lines.forEach(function (line) {
+      var item = document.createElement('div');
+      item.textContent = line;
+      box.appendChild(item);
+    });
+  }
+
+  function openMappingDialog(card, domainName, databaseName) {
+    var oldDialog = document.getElementById('pgmanager-mapping-dialog');
+    if (oldDialog) oldDialog.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'pgmanager-mapping-dialog';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:1050;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:20px';
+    var dialog = document.createElement('div');
+    dialog.className = 'card';
+    dialog.style.cssText = 'width:min(900px,100%);max-height:92vh;overflow:auto';
+    dialog.innerHTML =
+      '<div class="card-header">PostgreSQL Connection Settings</div>' +
+      '<div class="card-body">' +
+        '<p>Database: <strong class="pgmanager-mapping-database"></strong></p>' +
+        '<p>Leave every field empty to use automatic detection. When a Connection URL variable is configured, it is used on its own and the other fields are ignored.</p>' +
+        '<div class="alert alert-info">Enter variable names, not their values. For example: <code>PG_DATABASE_PROD</code>. Password values are never displayed or stored by this helper.</div>' +
+        '<div class="alert alert-danger pgmanager-mapping-error" style="display:none"></div>' +
+        '<div class="alert pgmanager-mapping-report" style="display:none"></div>' +
+        '<div class="row">' +
+          '<div class="col-12"><label class="col-form-label">Connection URL variable</label><input class="form-control" data-mapping-field="url"><small>A complete postgres:// or postgresql:// URL. Leave empty to use the separate fields.</small></div>' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Host variable</label><input class="form-control" data-mapping-field="host"><small>Defaults to localhost when empty.</small></div>' +
+          '<div class="col-6"><label class="col-form-label">Port variable</label><input class="form-control" data-mapping-field="port"><small>Defaults to 5432 when empty.</small></div>' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">User variable</label><input class="form-control" data-mapping-field="user"></div>' +
+          '<div class="col-6"><label class="col-form-label">Password variable</label><input class="form-control" data-mapping-field="password"></div>' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Database name variable</label><input class="form-control" data-mapping-field="dbname"></div>' +
+        '</div>' +
+        '<div class="row mt-3"><div class="col text-end"><button type="button" class="btn btn-md btn-white pgmanager-mapping-cancel">Cancel</button> <button type="button" class="btn btn-md btn-blue pgmanager-mapping-save">Save</button></div></div>' +
+      '</div>';
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    dialog.querySelector('.pgmanager-mapping-database').textContent = databaseName;
+
+    var errorBox = dialog.querySelector('.pgmanager-mapping-error');
+    var save = dialog.querySelector('.pgmanager-mapping-save');
+    function showError(error) {
+      errorBox.textContent = error.message || String(error);
+      errorBox.style.display = '';
+    }
+    function fill(payload) {
+      var mapping = payload.mapping || {};
+      dialog.querySelectorAll('[data-mapping-field]').forEach(function (input) {
+        input.value = mapping[input.getAttribute('data-mapping-field')] || '';
+      });
+      renderMappingReport(dialog, payload.report);
+    }
+
+    dialog.querySelector('.pgmanager-mapping-cancel').addEventListener('click', function () { overlay.remove(); });
+    overlay.addEventListener('click', function (event) { if (event.target === overlay) overlay.remove(); });
+    save.disabled = true;
+    api('/api/postgresql/mapping?domainName=' + encodeURIComponent(domainName) + '&databaseName=' + encodeURIComponent(databaseName))
+      .then(function (payload) { fill(payload); save.disabled = false; })
+      .catch(function (error) { showError(error); });
+
+    save.addEventListener('click', function () {
+      var mapping = {};
+      dialog.querySelectorAll('[data-mapping-field]').forEach(function (input) {
+        mapping[input.getAttribute('data-mapping-field')] = input.value.trim();
+      });
+      save.disabled = true;
+      errorBox.style.display = 'none';
+      api('/api/postgresql/mapping', {
+        method: 'POST',
+        body: JSON.stringify({ domainName: domainName, databaseName: databaseName, mapping: mapping })
+      }).then(function (payload) {
+        fill(payload);
+        save.disabled = false;
+      }).catch(function (error) {
+        showError(error);
+        save.disabled = false;
+      });
+    });
+  }
+
+  function deletePostgresDatabase(card, domainName, databaseName) {
+    if (!window.confirm('Are you sure?')) return;
+    api('/api/postgresql/databases/delete', {
+      method: 'POST',
+      body: JSON.stringify({ domainName: domainName, databaseName: databaseName })
+    }).then(function (payload) {
+      var warnings = payload.database && payload.database.roleCleanupWarnings;
+      if (Array.isArray(warnings) && warnings.length) {
+        window.alert('The database was deleted, but these shared/in-use PostgreSQL roles were kept: ' + warnings.join(', '));
+      }
+      window.location.reload();
+    }).catch(function (error) {
+      showPostgresError(card, error.message);
+    });
+  }
+
+  function buildPostgresCard(postgresql, domainName) {
+    var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
+    var card = document.createElement('div');
+    card.className = 'card card-table';
+    card.id = 'pgmanager-postgresql-databases';
+
+    var header = document.createElement('div');
+    header.className = 'card-header d-flex justify-content-between';
+    var heading = document.createElement('div');
+    heading.appendChild(document.createTextNode('PostgreSQL Databases'));
+
+    var information = document.createElement('span');
+    information.className = 'database-server-information';
+    var list = document.createElement('ul');
+    var hostItem = document.createElement('li');
+    var hostLabel = document.createElement('strong');
+    hostLabel.textContent = 'Host';
+    hostItem.appendChild(hostLabel);
+    hostItem.appendChild(document.createTextNode(': ' + (postgresql.host || '-')));
+    var portItem = document.createElement('li');
+    var portLabel = document.createElement('strong');
+    portLabel.textContent = 'Port';
+    portItem.appendChild(portLabel);
+    portItem.appendChild(document.createTextNode(': ' + (postgresql.port || '-')));
+    list.appendChild(hostItem);
+    list.appendChild(portItem);
+    information.appendChild(list);
+    heading.appendChild(information);
+    header.appendChild(heading);
+    card.appendChild(header);
+
+    if (!postgresql.available) {
+      var unavailableBody = document.createElement('div');
+      unavailableBody.className = 'card-body';
+      unavailableBody.textContent = postgresql.error || 'PostgreSQL is installed but is not available.';
+      card.appendChild(unavailableBody);
+      return card;
+    }
+
+    if (!databases.length) {
+      var emptyBody = document.createElement('div');
+      emptyBody.className = 'card-body';
+      emptyBody.textContent = 'No PostgreSQL databases found for this site.';
+      card.appendChild(emptyBody);
+      return card;
+    }
+
+    var body = document.createElement('div');
+    body.className = 'card-body card-body-no-padding';
+    var table = document.createElement('table');
+    table.className = 'table';
+    var tableHead = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    var databaseHeading = document.createElement('th');
+    databaseHeading.textContent = 'Database';
+    var actionHeading = document.createElement('th');
+    actionHeading.width = '260';
+    actionHeading.className = 'text-end';
+    actionHeading.textContent = 'Action';
+    headerRow.appendChild(databaseHeading);
+    headerRow.appendChild(actionHeading);
+    tableHead.appendChild(headerRow);
+    table.appendChild(tableHead);
+
+    var tableBody = document.createElement('tbody');
+    databases.forEach(function (database) {
+      var row = document.createElement('tr');
+      appendTextCell(row, database.name || '');
+      var actionCell = document.createElement('td');
+      actionCell.className = 'text-end table-actions';
+      var settings = document.createElement('a');
+      settings.href = 'javascript:void(0)';
+      settings.textContent = 'Connection Settings';
+      settings.style.marginRight = '16px';
+      settings.addEventListener('click', function () {
+        openMappingDialog(card, domainName, database.name);
+      });
+      actionCell.appendChild(settings);
+      var remove = document.createElement('a');
+      remove.href = 'javascript:void(0)';
+      remove.className = 'delete';
+      remove.textContent = 'Delete';
+      remove.addEventListener('click', function () {
+        deletePostgresDatabase(card, domainName, database.name);
+      });
+      actionCell.appendChild(remove);
+      row.appendChild(actionCell);
+      tableBody.appendChild(row);
+    });
+    table.appendChild(tableBody);
+    body.appendChild(table);
+    card.appendChild(body);
+    return card;
+  }
+
+  function permissionLabel(value) {
+    return value === 'read_only' ? 'Read Only' : 'Read and Write';
+  }
+
+  function openEditUserDialog(card, domainName, user) {
+    var oldDialog = document.getElementById('pgmanager-edit-user-dialog');
+    if (oldDialog) oldDialog.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'pgmanager-edit-user-dialog';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:1050;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:20px';
+    var dialog = document.createElement('div');
+    dialog.className = 'card';
+    dialog.style.cssText = 'width:min(720px,100%);max-height:90vh;overflow:auto';
+    dialog.innerHTML =
+      '<div class="card-header">Edit PostgreSQL Database User</div>' +
+      '<div class="card-body">' +
+        '<div class="alert alert-danger pgmanager-edit-error" style="display:none"></div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Database User Name</label><input class="form-control pgmanager-edit-name" disabled></div>' +
+          '<div class="col-6"><label class="col-form-label">New Password</label><input type="password" class="form-control pgmanager-edit-password"><a href="javascript:void(0)" class="pgmanager-generate-password">Generate new password</a><br><small>Leave empty to keep the current password.</small></div>' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Database</label><input class="form-control pgmanager-edit-database" disabled></div>' +
+          '<div class="col-6"><label class="col-form-label">Permissions</label><select class="form-select pgmanager-edit-permissions"><option value="read_write">Read and Write</option><option value="read_only">Read Only</option></select></div>' +
+        '</div>' +
+        '<div class="row mt-3"><div class="col text-end"><button type="button" class="btn btn-md btn-white pgmanager-edit-cancel">Cancel</button> <button type="button" class="btn btn-md btn-blue pgmanager-edit-save">Save</button></div></div>' +
+      '</div>';
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    dialog.querySelector('.pgmanager-edit-name').value = user.userName;
+    dialog.querySelector('.pgmanager-edit-database').value = user.databaseName;
+    dialog.querySelector('.pgmanager-edit-permissions').value = user.permissions;
+    dialog.querySelector('.pgmanager-generate-password').addEventListener('click', function () {
+      if (typeof window.generatePassword === 'function') {
+        dialog.querySelector('.pgmanager-edit-password').value = window.generatePassword(20);
+      }
+    });
+    dialog.querySelector('.pgmanager-edit-cancel').addEventListener('click', function () { overlay.remove(); });
+    overlay.addEventListener('click', function (event) { if (event.target === overlay) overlay.remove(); });
+    dialog.querySelector('.pgmanager-edit-save').addEventListener('click', function () {
+      var save = this;
+      var errorBox = dialog.querySelector('.pgmanager-edit-error');
+      save.disabled = true;
+      errorBox.style.display = 'none';
+      api('/api/postgresql/users/update', {
+        method: 'POST',
+        body: JSON.stringify({
+          domainName: domainName,
+          databaseName: user.databaseName,
+          userName: user.userName,
+          password: dialog.querySelector('.pgmanager-edit-password').value,
+          permissions: dialog.querySelector('.pgmanager-edit-permissions').value
+        })
+      }).then(function () {
+        window.location.reload();
+      }).catch(function (error) {
+        errorBox.textContent = error.message;
+        errorBox.style.display = '';
+        save.disabled = false;
+      });
+    });
+  }
+
+  function openAdminer(card, domainName, databaseName) {
+    var popup = window.open('about:blank', '_blank');
+    if (popup) popup.document.title = 'Opening Adminer...';
+
+    api('/api/postgresql/adminer-ticket', {
+      method: 'POST',
+      body: JSON.stringify({ domainName: domainName, databaseName: databaseName })
+    }).then(function (payload) {
+      var destination = pgManagerApiBase + payload.adminerPath;
+      if (popup) popup.location.replace(destination);
+      else window.open(destination, '_blank');
+    }).catch(function (error) {
+      if (popup) popup.close();
+      showPostgresError(card, error.message);
+    });
+  }
+
+  function deletePostgresUser(card, domainName, user) {
+    if (!window.confirm('Are you sure?')) return;
+    api('/api/postgresql/users/delete', {
+      method: 'POST',
+      body: JSON.stringify({
+        domainName: domainName,
+        databaseName: user.databaseName,
+        userName: user.userName
+      })
+    }).then(function () {
+      window.location.reload();
+    }).catch(function (error) {
+      showPostgresError(card, error.message);
+    });
+  }
+
+  function buildPostgresUsersCard(postgresql, domainName, nativeUsersCard) {
+    var users = Array.isArray(postgresql.users) ? postgresql.users : [];
+    var card = document.createElement('div');
+    card.className = 'card card-table';
+    card.id = 'pgmanager-postgresql-users';
+
+    var header = document.createElement('div');
+    header.className = 'card-header d-flex justify-content-between';
+    var heading = document.createElement('div');
+    heading.textContent = 'PostgreSQL Database Users';
+    header.appendChild(heading);
+    var nativeAdd = nativeUsersCard ? nativeUsersCard.querySelector('.card-header a') : null;
+    if (nativeAdd) {
+      var add = nativeAdd.cloneNode(true);
+      add.textContent = 'Add PostgreSQL Database User';
+      header.appendChild(add);
+    }
+    card.appendChild(header);
+
+    if (!users.length) {
+      var empty = document.createElement('div');
+      empty.className = 'card-body';
+      empty.textContent = 'No PostgreSQL database users found.';
+      card.appendChild(empty);
+      return card;
+    }
+
+    var body = document.createElement('div');
+    body.className = 'card-body card-body-no-padding';
+    var table = document.createElement('table');
+    table.className = 'table';
+    table.innerHTML = '<thead><tr><th>User Name</th><th width="300">Database</th><th width="250">Adminer</th><th width="250">Permissions</th><th width="100" class="text-end">Action</th></tr></thead>';
+    var tableBody = document.createElement('tbody');
+
+    users.forEach(function (user) {
+      var row = document.createElement('tr');
+      var userCell = document.createElement('td');
+      var edit = document.createElement('a');
+      edit.href = 'javascript:void(0)';
+      edit.textContent = user.userName;
+      edit.addEventListener('click', function () { openEditUserDialog(card, domainName, user); });
+      userCell.appendChild(edit);
+      row.appendChild(userCell);
+      appendTextCell(row, user.databaseName);
+
+      var manageCell = document.createElement('td');
+      var manage = document.createElement('a');
+      manage.href = 'javascript:void(0)';
+      manage.textContent = 'Manage';
+      manage.addEventListener('click', function () { openAdminer(card, domainName, user.databaseName); });
+      manageCell.appendChild(manage);
+      row.appendChild(manageCell);
+      appendTextCell(row, permissionLabel(user.permissions));
+
+      var actionCell = document.createElement('td');
+      actionCell.className = 'text-end table-actions';
+      var remove = document.createElement('a');
+      remove.href = 'javascript:void(0)';
+      remove.className = 'delete';
+      remove.textContent = 'Delete';
+      remove.addEventListener('click', function () { deletePostgresUser(card, domainName, user); });
+      actionCell.appendChild(remove);
+      row.appendChild(actionCell);
+      tableBody.appendChild(row);
+    });
+
+    table.appendChild(tableBody);
+    body.appendChild(table);
+    card.appendChild(body);
+    return card;
+  }
+
+  function start() {
+    var domainName = getDomainNameFromPath();
+    if (!domainName || document.getElementById('pgmanager-postgresql-databases')) return;
+
+    var mariaDbCard = findMariaDbCard();
+    if (!mariaDbCard) return;
+
+    api('/api/postgresql?domainName=' + encodeURIComponent(domainName))
+      .then(function (payload) {
+        var postgresql = payload.postgresql || {};
+        if (!postgresql.installed) return;
+
+        renameMariaDbHeading(mariaDbCard);
+        var postgresCard = buildPostgresCard(postgresql, domainName);
+        mariaDbCard.parentNode.insertBefore(postgresCard, mariaDbCard.nextSibling);
+
+        var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
+        if (databases.length) {
+          var nativeUsersCard = findMariaDbUsersCard();
+          if (nativeUsersCard) {
+            replaceFirstHeadingText(nativeUsersCard, 'MariaDB Database Users');
+            nativeUsersCard.parentNode.insertBefore(
+              buildPostgresUsersCard(postgresql, domainName, nativeUsersCard),
+              nativeUsersCard.nextSibling
+            );
+          }
+        }
+      })
+      .catch(function (error) {
+        // A missing/unreachable helper must leave CloudPanel's native database
+        // page exactly as it was, rather than replacing it with an error.
+        console.error('PgManager:', error.message);
+      });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+{# END cloudpanel-pgmanager-helper #}

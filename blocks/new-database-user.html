@@ -1,0 +1,127 @@
+{# BEGIN cloudpanel-pgmanager-helper #}
+<script>
+/* Adds this site's PostgreSQL databases to CloudPanel's database selector. */
+(function () {
+  var pgManagerPort = '__PGMANAGER_HELPER_PORT__';
+  var pgManagerApiBase = 'https://' + window.location.hostname + ':' + pgManagerPort;
+  var postgresPrefix = 'pgmanager-postgresql:';
+
+  function getDomainNameFromPath() {
+    var segments = window.location.pathname.split('/').filter(Boolean);
+    var siteIndex = segments.indexOf('site');
+    if (siteIndex === -1 || !segments[siteIndex + 1]) return null;
+    try { return decodeURIComponent(segments[siteIndex + 1]); } catch (error) { return null; }
+  }
+
+  function getDatabasesUrl(domainName) {
+    var links = document.querySelectorAll('a[href]');
+    for (var index = 0; index < links.length; index++) {
+      try {
+        var candidate = new URL(links[index].href, window.location.origin);
+        if (/\/site\/[^/]+\/databases\/?$/.test(candidate.pathname)) return candidate.href;
+      } catch (error) {}
+    }
+    return '/site/' + encodeURIComponent(domainName) + '/databases';
+  }
+
+  function api(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    if (options.body) options.headers = { 'Content-Type': 'application/json' };
+    return fetch(pgManagerApiBase + path, options).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload && payload.error ? payload.error : 'Request failed');
+        }
+        return payload;
+      });
+    });
+  }
+
+  function showError(form, message) {
+    var error = document.getElementById('pgmanager-create-user-error');
+    if (!error) {
+      error = document.createElement('div');
+      error.id = 'pgmanager-create-user-error';
+      error.className = 'alert alert-danger';
+      form.parentNode.insertBefore(error, form);
+    }
+    error.textContent = message;
+  }
+
+  function normalizedPermissions(select) {
+    var value = String(select.value || '').toLowerCase();
+    var option = select.options[select.selectedIndex];
+    var label = option ? String(option.textContent || '').toLowerCase() : '';
+    var readOnly = value.indexOf('read_only') !== -1
+      || label.indexOf('read only') !== -1
+      || label.indexOf('solo lectura') !== -1;
+    return readOnly ? 'read_only' : 'read_write';
+  }
+
+  function appendPostgresDatabases(select, databases) {
+    if (!databases.length || select.querySelector('optgroup[data-pgmanager="postgresql"]')) return;
+    var group = document.createElement('optgroup');
+    group.label = 'PostgreSQL';
+    group.setAttribute('data-pgmanager', 'postgresql');
+
+    databases.forEach(function (database) {
+      var option = document.createElement('option');
+      option.value = postgresPrefix + database.name;
+      option.textContent = database.name + ' (PostgreSQL)';
+      group.appendChild(option);
+    });
+    select.appendChild(group);
+  }
+
+  function start() {
+    var domainName = getDomainNameFromPath();
+    var userInput = document.getElementById('site_database_user_userName');
+    var passwordInput = document.getElementById('site_database_user_password');
+    var databaseSelect = document.getElementById('site_database_user_database');
+    var permissionsSelect = document.getElementById('site_database_user_permissions');
+    if (!domainName || !userInput || !passwordInput || !databaseSelect || !permissionsSelect) return;
+
+    var form = userInput.closest('form');
+    if (!form) return;
+
+    api('/api/postgresql?domainName=' + encodeURIComponent(domainName))
+      .then(function (payload) {
+        var postgresql = payload.postgresql || {};
+        var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
+        if (!postgresql.installed || !postgresql.available || !databases.length) return;
+        appendPostgresDatabases(databaseSelect, databases);
+
+        form.addEventListener('submit', function (event) {
+          if (databaseSelect.value.indexOf(postgresPrefix) !== 0) return;
+          event.preventDefault();
+
+          var submit = form.querySelector('[type="submit"]');
+          if (submit) submit.disabled = true;
+          api('/api/postgresql/users', {
+            method: 'POST',
+            body: JSON.stringify({
+              domainName: domainName,
+              databaseName: databaseSelect.value.slice(postgresPrefix.length),
+              userName: userInput.value,
+              password: passwordInput.value,
+              permissions: normalizedPermissions(permissionsSelect)
+            })
+          }).then(function () {
+            window.location.assign(getDatabasesUrl(domainName));
+          }).catch(function (error) {
+            showError(form, error.message);
+            if (submit) submit.disabled = false;
+          });
+        });
+      })
+      .catch(function (error) {
+        console.error('PgManager:', error.message);
+      });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+{# END cloudpanel-pgmanager-helper #}

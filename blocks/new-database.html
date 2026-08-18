@@ -1,0 +1,132 @@
+{# BEGIN cloudpanel-pgmanager-helper #}
+<script>
+/* Adds the PostgreSQL engine choice while preserving CloudPanel's native form. */
+(function () {
+  var pgManagerPort = '__PGMANAGER_HELPER_PORT__';
+  var pgManagerApiBase = 'https://' + window.location.hostname + ':' + pgManagerPort;
+
+  function getDomainNameFromPath() {
+    var segments = window.location.pathname.split('/').filter(Boolean);
+    var siteIndex = segments.indexOf('site');
+    if (siteIndex === -1 || !segments[siteIndex + 1]) return null;
+    try { return decodeURIComponent(segments[siteIndex + 1]); } catch (error) { return null; }
+  }
+
+  function getDatabasesUrl(domainName) {
+    var links = document.querySelectorAll('a[href]');
+    for (var index = 0; index < links.length; index++) {
+      try {
+        var candidate = new URL(links[index].href, window.location.origin);
+        if (/\/site\/[^/]+\/databases\/?$/.test(candidate.pathname)) return candidate.href;
+      } catch (error) {}
+    }
+    return '/site/' + encodeURIComponent(domainName) + '/databases';
+  }
+
+  function api(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    if (options.body) options.headers = { 'Content-Type': 'application/json' };
+    return fetch(pgManagerApiBase + path, options).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload && payload.error ? payload.error : 'Request failed');
+        }
+        return payload;
+      });
+    });
+  }
+
+  function showError(form, message) {
+    var error = document.getElementById('pgmanager-create-database-error');
+    if (!error) {
+      error = document.createElement('div');
+      error.id = 'pgmanager-create-database-error';
+      error.className = 'alert alert-danger';
+      form.parentNode.insertBefore(error, form);
+    }
+    error.textContent = message;
+  }
+
+  function addEngineSelector(form, nameInput) {
+    var nameRow = nameInput.closest('.row');
+    if (!nameRow || document.getElementById('pgmanager_database_engine')) return null;
+
+    var row = document.createElement('div');
+    row.className = 'row';
+    var column = document.createElement('div');
+    column.className = 'col-12';
+    var label = document.createElement('label');
+    label.className = 'col-form-label';
+    label.htmlFor = 'pgmanager_database_engine';
+    label.textContent = 'Database Server';
+    var select = document.createElement('select');
+    select.id = 'pgmanager_database_engine';
+    select.className = 'form-select';
+
+    var mariaDb = document.createElement('option');
+    mariaDb.value = 'mariadb';
+    mariaDb.textContent = 'MariaDB';
+    var postgresql = document.createElement('option');
+    postgresql.value = 'postgresql';
+    postgresql.textContent = 'PostgreSQL';
+    select.appendChild(mariaDb);
+    select.appendChild(postgresql);
+    column.appendChild(label);
+    column.appendChild(select);
+    row.appendChild(column);
+    nameRow.parentNode.insertBefore(row, nameRow);
+    return select;
+  }
+
+  function start() {
+    var domainName = getDomainNameFromPath();
+    var nameInput = document.getElementById('site_database_name');
+    var userInput = document.getElementById('site_database_userName');
+    var passwordInput = document.getElementById('site_database_userPassword');
+    if (!domainName || !nameInput || !userInput || !passwordInput) return;
+
+    var form = nameInput.closest('form');
+    if (!form) return;
+
+    api('/api/postgresql?domainName=' + encodeURIComponent(domainName))
+      .then(function (payload) {
+        var postgresql = payload.postgresql || {};
+        if (!postgresql.installed || !postgresql.available) return;
+
+        var engine = addEngineSelector(form, nameInput);
+        if (!engine) return;
+
+        form.addEventListener('submit', function (event) {
+          if (engine.value !== 'postgresql') return;
+          event.preventDefault();
+
+          var submit = form.querySelector('[type="submit"]');
+          if (submit) submit.disabled = true;
+
+          api('/api/postgresql/databases', {
+            method: 'POST',
+            body: JSON.stringify({
+              domainName: domainName,
+              databaseName: nameInput.value,
+              userName: userInput.value,
+              password: passwordInput.value
+            })
+          }).then(function () {
+            window.location.assign(getDatabasesUrl(domainName));
+          }).catch(function (error) {
+            showError(form, error.message);
+            if (submit) submit.disabled = false;
+          });
+        });
+      })
+      .catch(function (error) {
+        console.error('PgManager:', error.message);
+      });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+{# END cloudpanel-pgmanager-helper #}

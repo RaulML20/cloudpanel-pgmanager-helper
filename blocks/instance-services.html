@@ -1,0 +1,185 @@
+{# BEGIN cloudpanel-pgmanager-helper #}
+<script>
+/* Adds the global Adminer catalogue to Admin Area > Instance > Services. */
+(function () {
+  var adminerHelperPort = '__PGMANAGER_HELPER_PORT__';
+  var adminerApiBase = 'https://' + window.location.hostname + ':' + adminerHelperPort;
+
+  function start() {
+    var container = document.querySelector('.instance-services-container');
+    if (!container || document.getElementById('adminer-versions-card')) return;
+
+    var card = document.createElement('div');
+    card.className = 'card card-table mt-4';
+    card.id = 'adminer-versions-card';
+    card.innerHTML =
+      '<div class="card-header d-flex justify-content-between">' +
+        '<span>Adminer Versions</span>' +
+        '<button type="button" id="adminer-catalog-refresh" class="btn btn-sm btn-white">Refresh Catalog</button>' +
+      '</div>' +
+      '<div class="card-body card-body-no-padding">' +
+        '<div id="adminer-catalog-error" class="alert alert-danger m-3" style="display:none;white-space:pre-wrap"></div>' +
+        '<table class="table table-users">' +
+          '<thead><tr>' +
+            '<th width="150">Status</th>' +
+            '<th width="180">Version</th>' +
+            '<th>Installed File</th>' +
+            '<th width="200" class="text-end">Action</th>' +
+          '</tr></thead>' +
+          '<tbody id="adminer-versions-tbody"><tr><td colspan="4">Loading Adminer versions...</td></tr></tbody>' +
+        '</table>' +
+      '</div>';
+    container.appendChild(card);
+
+    var tbody = document.getElementById('adminer-versions-tbody');
+    var errorBox = document.getElementById('adminer-catalog-error');
+    var refreshButton = document.getElementById('adminer-catalog-refresh');
+    var busy = false;
+    var visibleAvailableCount = 5;
+
+    function api(path, options) {
+      options = options || {};
+      options.credentials = 'include';
+      if (options.body) options.headers = { 'Content-Type': 'application/json' };
+
+      return fetch(adminerApiBase + path, options).then(function (response) {
+        return response.json().then(function (payload) {
+          if (!response.ok || !payload.ok) {
+            throw new Error(payload && payload.error ? payload.error : 'Request failed');
+          }
+          return payload;
+        });
+      });
+    }
+
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.style.display = '';
+    }
+
+    function setMessage(message) {
+      tbody.innerHTML = '';
+      var row = document.createElement('tr');
+      var cell = document.createElement('td');
+      cell.colSpan = 4;
+      cell.textContent = message;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+    }
+
+    function actionLink(label, handler) {
+      var link = document.createElement('a');
+      link.href = 'javascript:void(0);';
+      link.textContent = label;
+      link.addEventListener('click', handler);
+      return link;
+    }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes)) return '-';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+    }
+
+    function buildRow(item) {
+      var row = document.createElement('tr');
+      var statusCell = document.createElement('td');
+      var badge = document.createElement('span');
+      badge.className = 'label-outline ' + (item.installed ? 'label-outline-green' : 'label-outline-orange');
+      badge.textContent = item.installed ? 'Installed' : 'Available';
+      statusCell.appendChild(badge);
+      row.appendChild(statusCell);
+
+      var versionCell = document.createElement('td');
+      versionCell.textContent = 'Adminer ' + item.version;
+      row.appendChild(versionCell);
+
+      var fileCell = document.createElement('td');
+      fileCell.textContent = item.installed ? item.path + ' (' + formatBytes(item.size) + ')' : '-';
+      row.appendChild(fileCell);
+
+      var actionCell = document.createElement('td');
+      actionCell.className = 'text-end table-actions';
+
+      if (item.installed) {
+        actionCell.appendChild(actionLink('Uninstall', function () {
+          if (busy || !confirm('Uninstall Adminer ' + item.version + '?')) return;
+          busy = true;
+          errorBox.style.display = 'none';
+          badge.textContent = 'Removing...';
+          api('/api/versions/remove', { method: 'POST', body: JSON.stringify({ version: item.version }) })
+            .then(load)
+            .catch(function (error) { badge.textContent = 'Installed'; showError(error.message); })
+            .then(function () { busy = false; });
+        }));
+      } else {
+        actionCell.appendChild(actionLink('Install', function () {
+          if (busy) return;
+          busy = true;
+          errorBox.style.display = 'none';
+          badge.textContent = 'Installing...';
+          api('/api/versions/install', { method: 'POST', body: JSON.stringify({ version: item.version }) })
+            .then(load)
+            .catch(function (error) { badge.textContent = 'Available'; showError(error.message); })
+            .then(function () { busy = false; });
+        }));
+      }
+
+      row.appendChild(actionCell);
+      return row;
+    }
+
+    function render(payload) {
+      tbody.innerHTML = '';
+      if (!payload.versions.length) {
+        setMessage('No Adminer versions found. Could not reach the GitHub catalogue.');
+        return;
+      }
+
+      var installed = payload.versions.filter(function (item) { return item.installed; });
+      var available = payload.versions.filter(function (item) { return !item.installed; });
+      var visible = available.slice(0, visibleAvailableCount);
+      var rest = available.slice(visibleAvailableCount);
+      installed.forEach(function (item) { tbody.appendChild(buildRow(item)); });
+      visible.forEach(function (item) { tbody.appendChild(buildRow(item)); });
+
+      if (!rest.length) return;
+      var moreRow = document.createElement('tr');
+      var moreCell = document.createElement('td');
+      moreCell.colSpan = 4;
+      moreCell.className = 'text-center';
+      var moreLink = document.createElement('a');
+      moreLink.href = 'javascript:void(0);';
+      moreLink.textContent = 'View ' + rest.length + ' more version' + (rest.length === 1 ? '' : 's');
+      moreLink.addEventListener('click', function () {
+        rest.forEach(function (item) { tbody.insertBefore(buildRow(item), moreRow); });
+        moreRow.remove();
+      });
+      moreCell.appendChild(moreLink);
+      moreRow.appendChild(moreCell);
+      tbody.appendChild(moreRow);
+    }
+
+    function load(forceRefresh) {
+      setMessage('Loading Adminer versions...');
+      return api('/api/versions' + (forceRefresh === true ? '?refresh=1' : ''))
+        .then(render)
+        .catch(function (error) {
+          setMessage('Could not load Adminer versions.');
+          showError(error.message + ' - Is the PgManager helper service running?');
+        });
+    }
+
+    refreshButton.addEventListener('click', function () {
+      errorBox.style.display = 'none';
+      load(true);
+    });
+    load();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+{# END cloudpanel-pgmanager-helper #}

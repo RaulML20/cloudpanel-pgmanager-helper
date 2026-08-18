@@ -1,0 +1,15 @@
+{
+  "name": "cloudpanel-pgmanager-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Adminer version manager for PostgreSQL databases in CloudPanel",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  }
+}
