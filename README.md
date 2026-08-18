@@ -63,7 +63,7 @@ CloudPanel PHP CLI binary before running the installer.
 
 ### Per-database environment variable names
 
-Each PostgreSQL database row has a **Connection Settings** action. Its modal
+Each PostgreSQL database row has a **Settings** action. Its modal
 can map a connection URL, host, port, user, password and database name to the
 exact variable names used by that backend, such as `PG_DATABASE_PROD`. Empty
 fields retain the automatic `DATABASE_URL`, `PG*`, `POSTGRES_*` and PostgreSQL
@@ -96,6 +96,12 @@ as the Adminer catalogue.
 
 Passwords are delivered to `psql` through standard input and are never placed
 in process arguments or written to the helper's registry.
+
+The database and database-user actions are shared between both engines. When
+MariaDB has databases, CloudPanel's native forms remain in charge and the
+database selector redirects PostgreSQL submissions to the helper. If a site
+has only PostgreSQL databases and CloudPanel refuses to render its native user
+form, the same **Add Database User** action opens a PostgreSQL modal instead.
 
 ## Safe template integration
 

@@ -75,6 +75,122 @@
     }
   }
 
+  function placeCardActionAbove(card, toolbarId, action) {
+    if (!card || !action || !card.parentNode || document.getElementById(toolbarId)) return null;
+    var toolbar = document.createElement('div');
+    toolbar.id = toolbarId;
+    toolbar.style.cssText = 'display:flex;justify-content:flex-end;margin-bottom:16px';
+    toolbar.appendChild(action);
+    card.parentNode.insertBefore(toolbar, card);
+    return action;
+  }
+
+  function moveCardActionAbove(card, toolbarId) {
+    if (!card) return null;
+    var action = card.querySelector('.card-header a[href], .card-header button');
+    return placeCardActionAbove(card, toolbarId, action);
+  }
+
+  function mariaDbHasDatabases(card) {
+    if (!card) return false;
+    var rows = card.querySelectorAll('tbody tr');
+    for (var index = 0; index < rows.length; index++) {
+      if (rows[index].querySelector('td')) return true;
+    }
+    return false;
+  }
+
+  function generatedPassword() {
+    if (typeof window.generatePassword === 'function') {
+      try {
+        var nativePassword = window.generatePassword(20);
+        if (typeof nativePassword === 'string' && nativePassword) return nativePassword;
+      } catch (error) {}
+    }
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') return '';
+    var alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*-_';
+    var bytes = new Uint32Array(20);
+    window.crypto.getRandomValues(bytes);
+    var result = '';
+    for (var index = 0; index < bytes.length; index++) result += alphabet[bytes[index] % alphabet.length];
+    return result;
+  }
+
+  function openCreatePostgresUserDialog(card, domainName, databases) {
+    var oldDialog = document.getElementById('pgmanager-create-user-dialog');
+    if (oldDialog) oldDialog.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'pgmanager-create-user-dialog';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:1050;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:20px';
+    var dialog = document.createElement('div');
+    dialog.className = 'card';
+    dialog.style.cssText = 'width:min(760px,100%);max-height:90vh;overflow:auto';
+    dialog.innerHTML =
+      '<div class="card-header">Add PostgreSQL Database User</div>' +
+      '<div class="card-body">' +
+        '<div class="alert alert-danger pgmanager-create-user-error" style="display:none"></div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Database User Name *</label><input class="form-control pgmanager-create-user-name" autocomplete="off"></div>' +
+          '<div class="col-6"><label class="col-form-label">Database User Password *</label><input type="password" class="form-control pgmanager-create-user-password" autocomplete="new-password"><a href="javascript:void(0)" class="pgmanager-create-user-generate">Generate new password</a></div>' +
+        '</div>' +
+        '<div class="row">' +
+          '<div class="col-6"><label class="col-form-label">Database *</label><select class="form-select pgmanager-create-user-database"></select></div>' +
+          '<div class="col-6"><label class="col-form-label">Permissions *</label><select class="form-select pgmanager-create-user-permissions"><option value="read_write">Read and Write</option><option value="read_only">Read Only</option></select></div>' +
+        '</div>' +
+        '<div class="row mt-3"><div class="col text-end"><button type="button" class="btn btn-md btn-white pgmanager-create-user-cancel">Cancel</button> <button type="button" class="btn btn-md btn-blue pgmanager-create-user-save">Add Database User</button></div></div>' +
+      '</div>';
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    var databaseSelect = dialog.querySelector('.pgmanager-create-user-database');
+    databases.forEach(function (database) {
+      var option = document.createElement('option');
+      option.value = database.name;
+      option.textContent = database.name;
+      databaseSelect.appendChild(option);
+    });
+    dialog.querySelector('.pgmanager-create-user-password').value = generatedPassword();
+    dialog.querySelector('.pgmanager-create-user-generate').addEventListener('click', function () {
+      dialog.querySelector('.pgmanager-create-user-password').value = generatedPassword();
+    });
+    dialog.querySelector('.pgmanager-create-user-cancel').addEventListener('click', function () { overlay.remove(); });
+    overlay.addEventListener('click', function (event) { if (event.target === overlay) overlay.remove(); });
+    dialog.querySelector('.pgmanager-create-user-save').addEventListener('click', function () {
+      var save = this;
+      var errorBox = dialog.querySelector('.pgmanager-create-user-error');
+      save.disabled = true;
+      errorBox.style.display = 'none';
+      api('/api/postgresql/users', {
+        method: 'POST',
+        body: JSON.stringify({
+          domainName: domainName,
+          databaseName: databaseSelect.value,
+          userName: dialog.querySelector('.pgmanager-create-user-name').value,
+          password: dialog.querySelector('.pgmanager-create-user-password').value,
+          permissions: dialog.querySelector('.pgmanager-create-user-permissions').value
+        })
+      }).then(function () {
+        window.location.reload();
+      }).catch(function (error) {
+        errorBox.textContent = error.message;
+        errorBox.style.display = '';
+        save.disabled = false;
+      });
+    });
+  }
+
+  function createPostgresUserButton(reference, card, domainName, databases) {
+    var button = document.createElement('a');
+    button.href = 'javascript:void(0)';
+    button.className = reference && reference.className ? reference.className : 'btn btn-md btn-blue';
+    button.textContent = 'Add Database User';
+    button.addEventListener('click', function () {
+      openCreatePostgresUserDialog(card, domainName, databases);
+    });
+    return button;
+  }
+
   function showPostgresError(card, message) {
     var error = card.querySelector('.pgmanager-users-error');
     if (!error) {
@@ -270,7 +386,7 @@
     var databaseHeading = document.createElement('th');
     databaseHeading.textContent = 'Database';
     var actionHeading = document.createElement('th');
-    actionHeading.width = '260';
+    actionHeading.width = '180';
     actionHeading.className = 'text-end';
     actionHeading.textContent = 'Action';
     headerRow.appendChild(databaseHeading);
@@ -284,14 +400,17 @@
       appendTextCell(row, database.name || '');
       var actionCell = document.createElement('td');
       actionCell.className = 'text-end table-actions';
+      actionCell.style.whiteSpace = 'nowrap';
+      var actions = document.createElement('span');
+      actions.style.cssText = 'display:inline-flex;align-items:center;justify-content:flex-end;gap:18px;white-space:nowrap';
       var settings = document.createElement('a');
       settings.href = 'javascript:void(0)';
-      settings.textContent = 'Connection Settings';
-      settings.style.marginRight = '16px';
+      settings.textContent = 'Settings';
+      settings.title = 'PostgreSQL Connection Settings';
       settings.addEventListener('click', function () {
         openMappingDialog(card, domainName, database.name);
       });
-      actionCell.appendChild(settings);
+      actions.appendChild(settings);
       var remove = document.createElement('a');
       remove.href = 'javascript:void(0)';
       remove.className = 'delete';
@@ -299,7 +418,8 @@
       remove.addEventListener('click', function () {
         deletePostgresDatabase(card, domainName, database.name);
       });
-      actionCell.appendChild(remove);
+      actions.appendChild(remove);
+      actionCell.appendChild(actions);
       row.appendChild(actionCell);
       tableBody.appendChild(row);
     });
@@ -407,7 +527,7 @@
     });
   }
 
-  function buildPostgresUsersCard(postgresql, domainName, nativeUsersCard) {
+  function buildPostgresUsersCard(postgresql, domainName) {
     var users = Array.isArray(postgresql.users) ? postgresql.users : [];
     var card = document.createElement('div');
     card.className = 'card card-table';
@@ -418,12 +538,6 @@
     var heading = document.createElement('div');
     heading.textContent = 'PostgreSQL Database Users';
     header.appendChild(heading);
-    var nativeAdd = nativeUsersCard ? nativeUsersCard.querySelector('.card-header a') : null;
-    if (nativeAdd) {
-      var add = nativeAdd.cloneNode(true);
-      add.textContent = 'Add PostgreSQL Database User';
-      header.appendChild(add);
-    }
     card.appendChild(header);
 
     if (!users.length) {
@@ -491,19 +605,33 @@
         var postgresql = payload.postgresql || {};
         if (!postgresql.installed) return;
 
+        var hasMariaDbDatabases = mariaDbHasDatabases(mariaDbCard);
         renameMariaDbHeading(mariaDbCard);
+        moveCardActionAbove(mariaDbCard, 'pgmanager-database-actions');
         var postgresCard = buildPostgresCard(postgresql, domainName);
         mariaDbCard.parentNode.insertBefore(postgresCard, mariaDbCard.nextSibling);
 
         var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
         if (databases.length) {
           var nativeUsersCard = findMariaDbUsersCard();
+          var postgresUsersCard = buildPostgresUsersCard(postgresql, domainName);
           if (nativeUsersCard) {
             replaceFirstHeadingText(nativeUsersCard, 'MariaDB Database Users');
-            nativeUsersCard.parentNode.insertBefore(
-              buildPostgresUsersCard(postgresql, domainName, nativeUsersCard),
-              nativeUsersCard.nextSibling
-            );
+            nativeUsersCard.parentNode.insertBefore(postgresUsersCard, nativeUsersCard.nextSibling);
+          } else {
+            postgresCard.parentNode.insertBefore(postgresUsersCard, postgresCard.nextSibling);
+          }
+
+          if (hasMariaDbDatabases && nativeUsersCard) {
+            moveCardActionAbove(nativeUsersCard, 'pgmanager-user-actions');
+          } else {
+            var nativeAdd = nativeUsersCard
+              ? nativeUsersCard.querySelector('.card-header a[href], .card-header button')
+              : null;
+            var databaseAdd = document.querySelector('#pgmanager-database-actions a, #pgmanager-database-actions button');
+            var addUser = createPostgresUserButton(nativeAdd || databaseAdd, postgresUsersCard, domainName, databases);
+            if (nativeAdd) nativeAdd.remove();
+            placeCardActionAbove(nativeUsersCard || postgresUsersCard, 'pgmanager-user-actions', addUser);
           }
         }
       })
