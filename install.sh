@@ -20,6 +20,9 @@ ADMINER_ROOT="${ADMINER_ROOT:-/opt/adminer}"
 PGMANAGER_ADMINER_PHP_HOST="${PGMANAGER_ADMINER_PHP_HOST:-127.0.0.1}"
 PGMANAGER_ADMINER_PHP_PORT="${PGMANAGER_ADMINER_PHP_PORT:-7882}"
 PGMANAGER_PHP_BINARY="${PGMANAGER_PHP_BINARY:-php}"
+PGMANAGER_DUMP_TEMP_DIR="${PGMANAGER_DUMP_TEMP_DIR:-/var/tmp}"
+PGMANAGER_DUMP_TIMEOUT_MS="${PGMANAGER_DUMP_TIMEOUT_MS:-14400000}"
+PGMANAGER_MAX_IMPORT_BYTES="${PGMANAGER_MAX_IMPORT_BYTES:-21474836480}"
 
 CLOUDPANEL_ROOT="${CLOUDPANEL_ROOT:-/home/clp/htdocs/app/files}"
 CLOUDPANEL_TEMPLATES_DIR="${CLOUDPANEL_TEMPLATES_DIR:-$CLOUDPANEL_ROOT/templates}"
@@ -32,6 +35,7 @@ CLOUDPANEL_TPL_NEW_DATABASE="${CLOUDPANEL_TPL_NEW_DATABASE:-}"
 CLOUDPANEL_TPL_NEW_DATABASE_USER="${CLOUDPANEL_TPL_NEW_DATABASE_USER:-}"
 BACKUP_SUFFIX=".cloudpanel-pgmanager-helper.bak"
 BLOCK_MARKER="BEGIN cloudpanel-pgmanager-helper"
+APT_UPDATED=0
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Please run this installer as root." >&2
@@ -55,6 +59,23 @@ if [ "$PGMANAGER_ADMINER_PHP_HOST" != "127.0.0.1" ] && [ "$PGMANAGER_ADMINER_PHP
     exit 1
 fi
 
+if [ ! -d "$PGMANAGER_DUMP_TEMP_DIR" ]; then
+    echo "PGMANAGER_DUMP_TEMP_DIR must be an existing directory." >&2
+    exit 1
+fi
+
+if ! echo "$PGMANAGER_DUMP_TIMEOUT_MS" | grep -Eq '^[0-9]+$' ||
+   [ "$PGMANAGER_DUMP_TIMEOUT_MS" -lt 60000 ]; then
+    echo "PGMANAGER_DUMP_TIMEOUT_MS must be an integer of at least 60000." >&2
+    exit 1
+fi
+
+if ! echo "$PGMANAGER_MAX_IMPORT_BYTES" | grep -Eq '^[0-9]+$' ||
+   [ "$PGMANAGER_MAX_IMPORT_BYTES" -lt 1048576 ]; then
+    echo "PGMANAGER_MAX_IMPORT_BYTES must be an integer of at least 1048576." >&2
+    exit 1
+fi
+
 if [ -z "$PGMANAGER_HELPER_ALLOWED_CLIENT_IPS" ]; then
     echo "PGMANAGER_HELPER_ALLOWED_CLIENT_IPS is required." >&2
     echo 'Example: PGMANAGER_HELPER_ALLOWED_CLIENT_IPS="YOUR_PUBLIC_IP" bash install.sh' >&2
@@ -67,6 +88,13 @@ log() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }
+}
+
+apt_update_once() {
+    if [ "$APT_UPDATED" -eq 0 ]; then
+        apt-get update
+        APT_UPDATED=1
+    fi
 }
 
 check_cloudpanel() {
@@ -95,6 +123,113 @@ check_php() {
         echo "PHP 7.4 or newer is required for the Adminer gateway." >&2
         exit 1
     fi
+}
+
+php_has_postgresql_driver() {
+    "$PGMANAGER_PHP_BINARY" -r \
+        'exit((extension_loaded("pdo_pgsql") || extension_loaded("pgsql")) ? 0 : 1);'
+}
+
+ensure_php_postgresql_driver() {
+    if php_has_postgresql_driver; then
+        log "PHP PostgreSQL driver already available"
+        return
+    fi
+
+    require_command apt-get
+    require_command apt-cache
+
+    local php_version package
+    php_version="$("$PGMANAGER_PHP_BINARY" -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')"
+    if ! echo "$php_version" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+        echo "Could not determine the PHP version used by $PGMANAGER_PHP_BINARY." >&2
+        exit 1
+    fi
+    package="php${php_version}-pgsql"
+
+    log "Installing PostgreSQL support for PHP $php_version ($package)"
+    apt_update_once
+    if ! apt-cache show "$package" >/dev/null 2>&1; then
+        echo "No APT package named $package is available for $PGMANAGER_PHP_BINARY." >&2
+        echo "Install the pgsql or pdo_pgsql extension for that exact PHP binary, then run this installer again." >&2
+        exit 1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"
+
+    if ! php_has_postgresql_driver; then
+        echo "$package was installed, but $PGMANAGER_PHP_BINARY still does not load pgsql or pdo_pgsql." >&2
+        echo "Loaded configuration files:" >&2
+        "$PGMANAGER_PHP_BINARY" --ini >&2 || true
+        exit 1
+    fi
+    log "PHP PostgreSQL driver installed successfully"
+}
+
+ensure_postgresql_dump_tools() {
+    # Installing the extension on a server without PostgreSQL is supported.
+    # When PostgreSQL is added later, its server package normally installs the
+    # matching client package as a dependency.
+    if ! command -v pg_lsclusters >/dev/null 2>&1; then
+        if command -v pg_dump >/dev/null 2>&1 &&
+           command -v pg_restore >/dev/null 2>&1 &&
+           command -v psql >/dev/null 2>&1; then
+            log "PostgreSQL dump and restore tools already available"
+        else
+            log "No local PostgreSQL cluster detected; client-tool installation skipped"
+        fi
+        return
+    fi
+
+    require_command apt-get
+    require_command apt-cache
+    local cluster_version package
+    cluster_version="$(pg_lsclusters --no-header 2>/dev/null | awk '$4 == "online" { print $1; exit }')"
+    if [ -z "$cluster_version" ]; then
+        cluster_version="$(pg_lsclusters --no-header 2>/dev/null | awk 'NR == 1 { print $1 }')"
+    fi
+    if ! echo "$cluster_version" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+        echo "PostgreSQL is present, but its cluster version could not be determined." >&2
+        exit 1
+    fi
+    package="postgresql-client-$cluster_version"
+
+    local all_tools_available=1 tool cluster_major client_major
+    for tool in pg_dump pg_restore psql; do
+        if [ ! -x "/usr/lib/postgresql/$cluster_version/bin/$tool" ]; then
+            all_tools_available=0
+        fi
+    done
+    if [ "$all_tools_available" -ne 1 ] &&
+       command -v pg_dump >/dev/null 2>&1 &&
+       command -v pg_restore >/dev/null 2>&1 &&
+       command -v psql >/dev/null 2>&1; then
+        cluster_major="${cluster_version%%.*}"
+        client_major="$(pg_dump --version 2>/dev/null | sed -E 's/.* ([0-9]+)(\.[0-9]+)?.*/\1/' || true)"
+        if echo "$client_major" | grep -Eq '^[0-9]+$' && [ "$client_major" -ge "$cluster_major" ]; then
+            all_tools_available=1
+        fi
+    fi
+    if [ "$all_tools_available" -eq 1 ]; then
+        log "PostgreSQL dump and restore tools already available for cluster $cluster_version"
+        return
+    fi
+
+    log "Installing PostgreSQL dump and restore tools ($package)"
+    apt_update_once
+    if ! apt-cache show "$package" >/dev/null 2>&1; then
+        echo "No APT package named $package is available for the detected PostgreSQL cluster." >&2
+        exit 1
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"
+
+    for tool in pg_dump pg_restore psql; do
+        if ! command -v "$tool" >/dev/null 2>&1 &&
+           [ ! -x "/usr/lib/postgresql/$cluster_version/bin/$tool" ]; then
+            echo "$package was installed, but required tool $tool is still unavailable." >&2
+            exit 1
+        fi
+    done
+    log "PostgreSQL dump and restore tools installed successfully"
 }
 
 detect_public_host() {
@@ -199,6 +334,9 @@ ADMINER_ROOT=$ADMINER_ROOT
 PGMANAGER_ADMINER_PHP_HOST=$PGMANAGER_ADMINER_PHP_HOST
 PGMANAGER_ADMINER_PHP_PORT=$PGMANAGER_ADMINER_PHP_PORT
 PGMANAGER_PHP_BINARY=$PGMANAGER_PHP_BINARY
+PGMANAGER_DUMP_TEMP_DIR=$PGMANAGER_DUMP_TEMP_DIR
+PGMANAGER_DUMP_TIMEOUT_MS=$PGMANAGER_DUMP_TIMEOUT_MS
+PGMANAGER_MAX_IMPORT_BYTES=$PGMANAGER_MAX_IMPORT_BYTES
 EOF
     chmod 0600 "$INSTALL_DIR/.env"
 }
@@ -319,6 +457,8 @@ locate_template 'services.html.twig' 'clp_admin_service_restart' "$CLOUDPANEL_TP
 locate_template 'databases.html.twig' 'database-server-information' "$CLOUDPANEL_TPL_DATABASES" >/dev/null
 locate_template 'new-database.html.twig' 'site_database_userPassword' "$CLOUDPANEL_TPL_NEW_DATABASE" >/dev/null
 locate_template 'new-database-user.html.twig' 'site_database_user_password' "$CLOUDPANEL_TPL_NEW_DATABASE_USER" >/dev/null
+ensure_php_postgresql_driver
+ensure_postgresql_dump_tools
 fetch_app
 install_node_dependencies
 write_env_file

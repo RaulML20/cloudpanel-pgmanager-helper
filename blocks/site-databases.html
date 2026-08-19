@@ -330,6 +330,133 @@
     });
   }
 
+  function exportPostgresDatabase(card, domainName, databaseName, action) {
+    var originalText = action.textContent;
+    action.textContent = 'Preparing...';
+    action.style.pointerEvents = 'none';
+    api('/api/postgresql/export-ticket', {
+      method: 'POST',
+      body: JSON.stringify({ domainName: domainName, databaseName: databaseName })
+    }).then(function (payload) {
+      var download = document.createElement('a');
+      download.href = pgManagerApiBase + payload.exportPath;
+      download.style.display = 'none';
+      document.body.appendChild(download);
+      download.click();
+      window.setTimeout(function () { download.remove(); }, 60000);
+    }).catch(function (error) {
+      showPostgresError(card, error.message);
+    }).finally(function () {
+      action.textContent = originalText;
+      action.style.pointerEvents = '';
+    });
+  }
+
+  function formatBytes(value) {
+    var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    var size = Number(value || 0);
+    var unit = 0;
+    while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+    return (unit ? size.toFixed(size >= 10 ? 1 : 2) : String(size)) + ' ' + units[unit];
+  }
+
+  function openImportPostgresDialog(card, domainName, databaseName, maxImportBytes) {
+    var oldDialog = document.getElementById('pgmanager-import-dialog');
+    if (oldDialog) oldDialog.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'pgmanager-import-dialog';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:1050;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;padding:20px';
+    var dialog = document.createElement('div');
+    dialog.className = 'card';
+    dialog.style.cssText = 'width:min(720px,100%);max-height:90vh;overflow:auto';
+    dialog.innerHTML =
+      '<div class="card-header">Import PostgreSQL Database</div>' +
+      '<div class="card-body">' +
+        '<p>Target database: <strong class="pgmanager-import-database"></strong></p>' +
+        '<div class="alert alert-warning">Importing changes the target database. Only import dumps from a trusted source. Custom and tar dumps clean matching objects before restoring them; plain SQL is executed as provided. Do not close this page until the operation finishes.</div>' +
+        '<div class="alert alert-danger pgmanager-import-error" style="display:none"></div>' +
+        '<label class="col-form-label">Dump file *</label>' +
+        '<input type="file" class="form-control pgmanager-import-file" accept=".dump,.backup,.tar,.sql,application/octet-stream,application/sql">' +
+        '<small>Supported formats: PostgreSQL custom/tar dump and plain SQL. Maximum upload: <span class="pgmanager-import-limit"></span>.</small>' +
+        '<div class="pgmanager-import-progress mt-3" style="display:none"></div>' +
+        '<div class="row mt-3"><div class="col text-end"><button type="button" class="btn btn-md btn-white pgmanager-import-cancel">Cancel</button> <button type="button" class="btn btn-md btn-blue pgmanager-import-save">Import</button></div></div>' +
+      '</div>';
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    dialog.querySelector('.pgmanager-import-database').textContent = databaseName;
+    dialog.querySelector('.pgmanager-import-limit').textContent = formatBytes(maxImportBytes);
+    var cancel = dialog.querySelector('.pgmanager-import-cancel');
+    var save = dialog.querySelector('.pgmanager-import-save');
+    var fileInput = dialog.querySelector('.pgmanager-import-file');
+    var errorBox = dialog.querySelector('.pgmanager-import-error');
+    var progress = dialog.querySelector('.pgmanager-import-progress');
+
+    cancel.addEventListener('click', function () { overlay.remove(); });
+    overlay.addEventListener('click', function (event) { if (event.target === overlay && !save.disabled) overlay.remove(); });
+    save.addEventListener('click', function () {
+      var file = fileInput.files && fileInput.files[0];
+      errorBox.style.display = 'none';
+      if (!file) {
+        errorBox.textContent = 'Choose a dump file to import.';
+        errorBox.style.display = '';
+        return;
+      }
+      if (file.size > maxImportBytes) {
+        errorBox.textContent = 'The selected file exceeds the configured import limit.';
+        errorBox.style.display = '';
+        return;
+      }
+      if (!window.confirm('Import this file into ' + databaseName + '? Existing matching objects may be replaced.')) return;
+
+      save.disabled = true;
+      cancel.disabled = true;
+      fileInput.disabled = true;
+      save.textContent = 'Importing...';
+      progress.style.display = '';
+      progress.textContent = 'Uploading 0%';
+
+      var request = new XMLHttpRequest();
+      request.open('POST', pgManagerApiBase + '/api/postgresql/import?domainName=' + encodeURIComponent(domainName) + '&databaseName=' + encodeURIComponent(databaseName));
+      request.withCredentials = true;
+      request.setRequestHeader('Content-Type', 'application/octet-stream');
+      request.upload.addEventListener('progress', function (event) {
+        if (event.lengthComputable) progress.textContent = 'Uploading ' + Math.round((event.loaded / event.total) * 100) + '%';
+      });
+      request.upload.addEventListener('load', function () { progress.textContent = 'Upload complete. Restoring database...'; });
+      request.addEventListener('load', function () {
+        var payload = null;
+        try { payload = JSON.parse(request.responseText); } catch (error) {}
+        if (request.status < 200 || request.status >= 300 || !payload || !payload.ok) {
+          errorBox.textContent = payload && payload.error ? payload.error : 'Database import failed.';
+          errorBox.style.display = '';
+          save.disabled = false;
+          cancel.disabled = false;
+          fileInput.disabled = false;
+          save.textContent = 'Import';
+          progress.style.display = 'none';
+          return;
+        }
+        var warnings = payload.database && payload.database.permissionWarnings;
+        if (Array.isArray(warnings) && warnings.length) {
+          window.alert('The database was imported, but permissions could not be refreshed for: ' + warnings.join(', '));
+        }
+        window.location.reload();
+      });
+      request.addEventListener('error', function () {
+        errorBox.textContent = 'The upload connection failed.';
+        errorBox.style.display = '';
+        save.disabled = false;
+        cancel.disabled = false;
+        fileInput.disabled = false;
+        save.textContent = 'Import';
+        progress.style.display = 'none';
+      });
+      request.send(file);
+    });
+  }
+
   function buildPostgresCard(postgresql, domainName) {
     var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
     var card = document.createElement('div');
@@ -386,7 +513,7 @@
     var databaseHeading = document.createElement('th');
     databaseHeading.textContent = 'Database';
     var actionHeading = document.createElement('th');
-    actionHeading.width = '180';
+    actionHeading.width = '340';
     actionHeading.className = 'text-end';
     actionHeading.textContent = 'Action';
     headerRow.appendChild(databaseHeading);
@@ -402,7 +529,7 @@
       actionCell.className = 'text-end table-actions';
       actionCell.style.whiteSpace = 'nowrap';
       var actions = document.createElement('span');
-      actions.style.cssText = 'display:inline-flex;align-items:center;justify-content:flex-end;gap:18px;white-space:nowrap';
+      actions.style.cssText = 'display:inline-flex;align-items:center;justify-content:flex-end;gap:16px;white-space:nowrap';
       var settings = document.createElement('a');
       settings.href = 'javascript:void(0)';
       settings.textContent = 'Settings';
@@ -411,6 +538,20 @@
         openMappingDialog(card, domainName, database.name);
       });
       actions.appendChild(settings);
+      var exportAction = document.createElement('a');
+      exportAction.href = 'javascript:void(0)';
+      exportAction.textContent = 'Export';
+      exportAction.addEventListener('click', function () {
+        exportPostgresDatabase(card, domainName, database.name, exportAction);
+      });
+      actions.appendChild(exportAction);
+      var importAction = document.createElement('a');
+      importAction.href = 'javascript:void(0)';
+      importAction.textContent = 'Import';
+      importAction.addEventListener('click', function () {
+        openImportPostgresDialog(card, domainName, database.name, postgresql.maxImportBytes);
+      });
+      actions.appendChild(importAction);
       var remove = document.createElement('a');
       remove.href = 'javascript:void(0)';
       remove.className = 'delete';

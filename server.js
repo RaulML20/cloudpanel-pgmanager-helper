@@ -37,8 +37,13 @@ const INSTALL_TIMEOUT = Number(process.env.PGMANAGER_HELPER_INSTALL_TIMEOUT_MS |
 const ADMINER_PHP_HOST = process.env.PGMANAGER_ADMINER_PHP_HOST || '127.0.0.1';
 const ADMINER_PHP_PORT = Number(process.env.PGMANAGER_ADMINER_PHP_PORT || 7882);
 const PHP_BINARY = process.env.PGMANAGER_PHP_BINARY || 'php';
+const DUMP_TEMP_DIR = process.env.PGMANAGER_DUMP_TEMP_DIR || '/var/tmp';
+const DUMP_TIMEOUT = Number(process.env.PGMANAGER_DUMP_TIMEOUT_MS || (4 * 60 * 60 * 1000));
+const MAX_IMPORT_BYTES = Number(process.env.PGMANAGER_MAX_IMPORT_BYTES || (20 * 1024 * 1024 * 1024));
 const operations = new Set();
 const adminerTickets = new Map();
+const dumpTickets = new Map();
+const databaseOperations = new Set();
 
 if(process.getuid && process.getuid() !== 0) {
     console.error('CloudPanel PgManager Helper must run as root.');
@@ -62,6 +67,24 @@ if(!Number.isInteger(ADMINER_PHP_PORT) || ADMINER_PHP_PORT < 1 || ADMINER_PHP_PO
 
 if(!['127.0.0.1', '::1'].includes(ADMINER_PHP_HOST)) {
     console.error('PGMANAGER_ADMINER_PHP_HOST must be a loopback address.');
+    process.exit(1);
+}
+
+if(!Number.isSafeInteger(DUMP_TIMEOUT) || DUMP_TIMEOUT < 60000) {
+    console.error('PGMANAGER_DUMP_TIMEOUT_MS must be an integer of at least 60000.');
+    process.exit(1);
+}
+
+if(!Number.isSafeInteger(MAX_IMPORT_BYTES) || MAX_IMPORT_BYTES < 1024 * 1024) {
+    console.error('PGMANAGER_MAX_IMPORT_BYTES must be an integer of at least 1048576.');
+    process.exit(1);
+}
+
+try {
+    const dumpTempStat = fs.statSync(fs.realpathSync(DUMP_TEMP_DIR));
+    if(!dumpTempStat.isDirectory()) throw new Error('not a directory');
+} catch(error) {
+    console.error(`PGMANAGER_DUMP_TEMP_DIR is not an accessible directory: ${DUMP_TEMP_DIR}`);
     process.exit(1);
 }
 
@@ -132,7 +155,7 @@ function validateCloudPanelSession(req, options = {}) {
     }
     if(!content.includes('ROLE_ADMIN')) return { ok: false, reason: 'Admin role required' };
 
-    return { ok: true };
+    return { ok: true, sessionId };
 }
 
 function isSafeVersion(version) {
@@ -160,7 +183,7 @@ function run(command, args, options = {}) {
             timeout: options.timeout || 60000,
             maxBuffer: 2 * 1024 * 1024,
             cwd: options.cwd,
-            env: process.env
+            env: options.env || process.env
         };
 
         if(options.uid !== undefined) execOptions.uid = options.uid;
@@ -185,6 +208,24 @@ async function commandExists(command) {
     } catch(error) {
         return false;
     }
+}
+
+async function phpPostgresqlDriverAvailable() {
+    try {
+        await run(PHP_BINARY, [
+            '-r',
+            'exit((extension_loaded("pdo_pgsql") || extension_loaded("pgsql")) ? 0 : 1);'
+        ], { timeout: 10000 });
+        return true;
+    } catch(error) {
+        return false;
+    }
+}
+
+async function assertPhpPostgresqlDriver() {
+    if(await phpPostgresqlDriverAvailable()) return;
+    throw new ApiError(409,
+        `PHP binary ${PHP_BINARY} does not load pgsql or pdo_pgsql. Re-run the PgManager installer to install its PHP PostgreSQL dependency.`);
 }
 
 function getSystemUser(username) {
@@ -641,6 +682,11 @@ async function deletePostgresDatabase(domainName, values) {
             adminerTickets.delete(ticket);
         }
     }
+    for(const [ticket, target] of dumpTickets) {
+        if(target.domainName === domainName && target.databaseName === databaseName) {
+            dumpTickets.delete(ticket);
+        }
+    }
 
     const remainingUsers = loadPostgresUsers();
     const referencedRoles = new Set(Object.values(remainingUsers).flatMap((items) =>
@@ -993,6 +1039,365 @@ async function buildPostgresMappingReport(domainName, databaseName) {
     }
 }
 
+function postgresToolEnvironment() {
+    return {
+        PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        HOME: '/var/lib/postgresql',
+        LANG: 'C.UTF-8',
+        LC_ALL: 'C.UTF-8',
+        PGAPPNAME: 'cloudpanel-pgmanager-helper',
+        PGCONNECT_TIMEOUT: '15'
+    };
+}
+
+function postgresClientEnvironment(connection, systemUser) {
+    return {
+        ...postgresToolEnvironment(),
+        HOME: systemUser.home,
+        PGPASSWORD: connection.password
+    };
+}
+
+async function resolvePostgresTool(cluster, toolName) {
+    if(!['pg_dump', 'pg_restore', 'psql'].includes(toolName)) {
+        throw new ApiError(500, 'Unsupported PostgreSQL tool');
+    }
+    if(cluster.version && /^\d+(?:\.\d+)?$/.test(String(cluster.version))) {
+        const versioned = `/usr/lib/postgresql/${cluster.version}/bin/${toolName}`;
+        try {
+            fs.accessSync(versioned, fs.constants.X_OK);
+            return versioned;
+        } catch(error) {}
+    }
+    if(await commandExists(toolName)) return toolName;
+    throw new ApiError(409, `PostgreSQL client tool ${toolName} is not installed`);
+}
+
+async function withDatabaseOperation(domainName, databaseName, operation) {
+    const key = `${domainName}\u0000${databaseName}`;
+    if(databaseOperations.has(key)) {
+        throw new ApiError(409, `Another import or export is already running for ${databaseName}`);
+    }
+    databaseOperations.add(key);
+    try {
+        return await operation();
+    } finally {
+        databaseOperations.delete(key);
+    }
+}
+
+function createDumpTempDirectory(postgresUser) {
+    const base = fs.realpathSync(DUMP_TEMP_DIR);
+    const staleBefore = Date.now() - DUMP_TIMEOUT - (60 * 60 * 1000);
+    try {
+        for(const entry of fs.readdirSync(base, { withFileTypes: true })) {
+            if(!entry.isDirectory() || !entry.name.startsWith('cloudpanel-pgmanager-')) continue;
+            const candidate = path.join(base, entry.name);
+            const stat = fs.lstatSync(candidate);
+            if(stat.uid === postgresUser.uid && stat.mtimeMs < staleBefore) {
+                removeDumpTempDirectory(candidate);
+            }
+        }
+    } catch(error) {
+        console.error(`Could not inspect stale PostgreSQL dump files: ${error.message}`);
+    }
+    const directory = fs.mkdtempSync(path.join(base, 'cloudpanel-pgmanager-'));
+    try {
+        fs.chownSync(directory, postgresUser.uid, postgresUser.gid);
+        fs.chmodSync(directory, 0o700);
+        return directory;
+    } catch(error) {
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch(ignored) {}
+        throw error;
+    }
+}
+
+function removeDumpTempDirectory(directory) {
+    if(!directory) return;
+    let base;
+    try { base = fs.realpathSync(DUMP_TEMP_DIR); } catch(error) {
+        console.error(`Could not resolve dump temporary directory during cleanup: ${error.message}`);
+        return;
+    }
+    const resolved = path.resolve(directory);
+    if(!resolved.startsWith(base + path.sep) || !path.basename(resolved).startsWith('cloudpanel-pgmanager-')) {
+        console.error(`Refusing to remove unexpected dump directory: ${resolved}`);
+        return;
+    }
+    try { fs.rmSync(resolved, { recursive: true, force: true }); } catch(error) {
+        console.error(`Could not remove PostgreSQL dump directory ${resolved}: ${error.message}`);
+    }
+}
+
+function receivePostgresImport(req, postgresUser, directory) {
+    const contentLength = Number(req.headers['content-length'] || 0);
+    if(!Number.isSafeInteger(contentLength) || contentLength < 0) {
+        throw new ApiError(400, 'Invalid upload size');
+    }
+    if(contentLength > MAX_IMPORT_BYTES) {
+        throw new ApiError(413, `Import exceeds the configured limit of ${MAX_IMPORT_BYTES} bytes`);
+    }
+
+    const destination = path.join(directory, 'import.upload');
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(destination, { flags: 'wx', mode: 0o600 });
+        let size = 0;
+        let uploadError = null;
+        let ended = false;
+        let settled = false;
+
+        const rejectOnce = (error) => {
+            if(settled) return;
+            settled = true;
+            reject(error);
+        };
+
+        output.on('error', (error) => {
+            uploadError = uploadError || new ApiError(500, `Could not store the import: ${error.message}`);
+            req.resume();
+            if(ended) rejectOnce(uploadError);
+        });
+        output.on('finish', () => {
+            if(settled) return;
+            if(uploadError) return rejectOnce(uploadError);
+            if(size === 0) return rejectOnce(new ApiError(400, 'The import file is empty'));
+            try {
+                fs.chownSync(destination, postgresUser.uid, postgresUser.gid);
+                fs.chmodSync(destination, 0o600);
+            } catch(error) {
+                return rejectOnce(new ApiError(500, `Could not secure the import file: ${error.message}`));
+            }
+            settled = true;
+            resolve({ path: destination, size });
+        });
+        req.on('data', (chunk) => {
+            if(uploadError) return;
+            size += chunk.length;
+            if(size > MAX_IMPORT_BYTES) {
+                uploadError = new ApiError(413, `Import exceeds the configured limit of ${MAX_IMPORT_BYTES} bytes`);
+                output.destroy();
+                req.resume();
+                return;
+            }
+            if(!output.write(chunk)) {
+                req.pause();
+                output.once('drain', () => req.resume());
+            }
+        });
+        req.on('end', () => {
+            ended = true;
+            if(uploadError) return rejectOnce(uploadError);
+            output.end();
+        });
+        req.on('aborted', () => {
+            uploadError = new ApiError(400, 'Import upload was interrupted');
+            output.destroy();
+            rejectOnce(uploadError);
+        });
+        req.on('error', (error) => {
+            uploadError = new ApiError(400, `Import upload failed: ${error.message}`);
+            output.destroy();
+            rejectOnce(uploadError);
+        });
+    });
+}
+
+function looksLikePlainPostgresSql(filePath) {
+    const descriptor = fs.openSync(filePath, 'r');
+    try {
+        const sample = Buffer.alloc(16384);
+        const bytesRead = fs.readSync(descriptor, sample, 0, sample.length, 0);
+        const content = sample.subarray(0, bytesRead);
+        if(!content.length || content.includes(0)) return false;
+        const text = content.toString('utf8').replace(/^\uFEFF/, '').trimStart();
+        return /^(--|\/\*|\\|SET\b|SELECT\b|CREATE\b|INSERT\b|UPDATE\b|DELETE\b|DROP\b|ALTER\b|BEGIN\b)/i.test(text);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+}
+
+async function assertSafePlainPostgresSql(filePath) {
+    const maxScannedLineBytes = 64 * 1024;
+    let line = '';
+    let overflow = false;
+    let inCopyData = false;
+    let pendingCopyStatement = false;
+
+    const inspectLine = () => {
+        const normalized = line.replace(/\r$/, '');
+        if(inCopyData) {
+            if(!overflow && normalized === '\\.') inCopyData = false;
+            line = '';
+            overflow = false;
+            return;
+        }
+
+        const trimmed = normalized.trimStart();
+        if(trimmed.startsWith('\\')) {
+            const match = /^\\([^\s]+)/.exec(trimmed);
+            const command = match ? match[1].toLowerCase() : '';
+            if(!['restrict', 'unrestrict'].includes(command)) {
+                throw new ApiError(400, 'Unsafe psql meta-command detected in plain SQL import');
+            }
+        }
+        if(/^COPY\b/i.test(trimmed)) pendingCopyStatement = true;
+        if(pendingCopyStatement) {
+            if(overflow) throw new ApiError(400, 'COPY statement is too long to validate safely');
+            if(/\bFROM\s+stdin\s*;\s*$/i.test(trimmed)) {
+                inCopyData = true;
+                pendingCopyStatement = false;
+            } else if(/;\s*$/.test(trimmed)) {
+                pendingCopyStatement = false;
+            }
+        }
+        line = '';
+        overflow = false;
+    };
+
+    for await (const chunk of fs.createReadStream(filePath)) {
+        for(const byte of chunk) {
+            if(byte === 10) {
+                inspectLine();
+                continue;
+            }
+            if(line.length < maxScannedLineBytes) line += String.fromCharCode(byte);
+            else overflow = true;
+        }
+    }
+    if(line.length || overflow) inspectLine();
+    if(inCopyData) throw new ApiError(400, 'Plain SQL import contains an unterminated COPY data section');
+}
+
+async function createPostgresExport(domainName, databaseName) {
+    return withDatabaseOperation(domainName, databaseName, async () => {
+        const context = await getPostgresDatabaseForSite(domainName, databaseName);
+        const pgDump = await resolvePostgresTool(context.cluster, 'pg_dump');
+        const directory = createDumpTempDirectory(context.postgresUser);
+        const filePath = path.join(directory, 'database.dump');
+        try {
+            await run(pgDump, [
+                '--format=custom', '--compress=6', '--no-owner', '--no-privileges', '--no-password',
+                '--port', String(context.cluster.port || 5432), '--dbname', databaseName,
+                '--file', filePath
+            ], {
+                uid: context.postgresUser.uid,
+                gid: context.postgresUser.gid,
+                timeout: DUMP_TIMEOUT,
+                env: postgresToolEnvironment()
+            });
+            const stat = fs.statSync(filePath);
+            if(!stat.isFile() || stat.size < 1) throw new ApiError(500, 'pg_dump created an empty export');
+            const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+            return {
+                directory,
+                filePath,
+                size: stat.size,
+                downloadName: `${databaseName}-${timestamp}.dump`
+            };
+        } catch(error) {
+            removeDumpTempDirectory(directory);
+            if(error instanceof ApiError) throw error;
+            throw new ApiError(500, `PostgreSQL export failed: ${error.message}`);
+        }
+    });
+}
+
+async function importPostgresDatabase(req, domainName, databaseName) {
+    return withDatabaseOperation(domainName, databaseName, async () => {
+        const context = await getPostgresDatabaseForSite(domainName, databaseName);
+        const resolvedConnection = await resolveAdminerConnection(domainName, databaseName);
+        const connection = resolvedConnection.connection;
+        const siteSystemUser = getSystemUser(context.siteUser);
+        if(!siteSystemUser) throw new ApiError(404, 'CloudPanel site user no longer exists');
+        const pgRestore = await resolvePostgresTool(context.cluster, 'pg_restore');
+        const psql = await resolvePostgresTool(context.cluster, 'psql');
+        try {
+            const ownership = await run(psql, [
+                '-X', '-q', '-A', '-t', '--no-password',
+                '--host', connection.host, '--port', String(connection.port),
+                '--username', connection.user, '--dbname', databaseName,
+                '--command', "SELECT json_build_object('owner', pg_get_userbyid(datdba) = current_user, 'superuser', (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)) FROM pg_database WHERE datname = current_database();"
+            ], {
+                uid: siteSystemUser.uid,
+                gid: siteSystemUser.gid,
+                timeout: 15000,
+                env: postgresClientEnvironment(connection, siteSystemUser)
+            });
+            const roleState = JSON.parse(ownership.stdout.trim() || '{}');
+            if(roleState.superuser) {
+                throw new ApiError(409, 'Import through a PostgreSQL superuser is refused; configure the non-superuser database owner in the .env');
+            }
+            if(!roleState.owner) {
+                throw new ApiError(409, 'The PostgreSQL user configured in the .env must own the target database before it can import a dump');
+            }
+        } catch(error) {
+            if(error instanceof ApiError) throw error;
+            throw new ApiError(409, 'The PostgreSQL connection configured in the .env could not authenticate for import');
+        }
+        const directory = createDumpTempDirectory(siteSystemUser);
+        try {
+            const upload = await receivePostgresImport(req, siteSystemUser, directory);
+            let format = 'archive';
+            try {
+                await run(pgRestore, ['--list', upload.path], {
+                    uid: siteSystemUser.uid,
+                    gid: siteSystemUser.gid,
+                    timeout: 60000,
+                    env: postgresToolEnvironment()
+                });
+            } catch(error) {
+                if(!looksLikePlainPostgresSql(upload.path)) {
+                    throw new ApiError(400, 'Unsupported import file. Use a PostgreSQL custom/tar dump or plain SQL file');
+                }
+                format = 'plain';
+            }
+
+            if(format === 'archive') {
+                await run(pgRestore, [
+                    '--exit-on-error', '--clean', '--if-exists', '--no-owner', '--no-privileges',
+                    '--no-password', '--host', connection.host, '--port', String(connection.port),
+                    '--username', connection.user, '--dbname', databaseName,
+                    upload.path
+                ], {
+                    uid: siteSystemUser.uid,
+                    gid: siteSystemUser.gid,
+                    timeout: DUMP_TIMEOUT,
+                    env: postgresClientEnvironment(connection, siteSystemUser)
+                });
+            } else {
+                await assertSafePlainPostgresSql(upload.path);
+                await run(psql, [
+                    '-X', '--set', 'ON_ERROR_STOP=1', '--no-password',
+                    '--host', connection.host, '--port', String(connection.port),
+                    '--username', connection.user, '--dbname', databaseName,
+                    '--file', upload.path
+                ], {
+                    uid: siteSystemUser.uid,
+                    gid: siteSystemUser.gid,
+                    timeout: DUMP_TIMEOUT,
+                    env: postgresClientEnvironment(connection, siteSystemUser)
+                });
+            }
+
+            const permissionWarnings = [];
+            for(const item of (loadPostgresUsers()[domainName] || []).filter((user) => user.databaseName === databaseName)) {
+                try {
+                    await applyPostgresPermissions(context.cluster, context.postgresUser, databaseName,
+                        context.database.owner, item.userName, item.permissions);
+                } catch(error) {
+                    permissionWarnings.push(item.userName);
+                }
+            }
+            return { name: databaseName, format, size: upload.size, permissionWarnings };
+        } catch(error) {
+            if(error instanceof ApiError) throw error;
+            throw new ApiError(500, `PostgreSQL import failed: ${error.message}`);
+        } finally {
+            removeDumpTempDirectory(directory);
+        }
+    });
+}
+
 function createAdminerTicket(sessionId, domainName, databaseName) {
     const now = Date.now();
     for(const [ticket, entry] of adminerTickets) {
@@ -1015,6 +1420,55 @@ function consumeAdminerTicket(ticket, sessionId) {
     adminerTickets.delete(String(ticket));
     if(entry.expiresAt <= Date.now() || entry.sessionId !== sessionId) return null;
     return entry;
+}
+
+function createDumpTicket(sessionId, domainName, databaseName) {
+    const now = Date.now();
+    for(const [ticket, entry] of dumpTickets) {
+        if(entry.expiresAt <= now) dumpTickets.delete(ticket);
+    }
+    const ticket = crypto.randomBytes(32).toString('base64url');
+    dumpTickets.set(ticket, { sessionId, domainName, databaseName, expiresAt: now + 60000 });
+    return ticket;
+}
+
+function consumeDumpTicket(ticket, sessionId) {
+    const key = String(ticket || '');
+    const entry = dumpTickets.get(key);
+    if(!entry) return null;
+    dumpTickets.delete(key);
+    if(entry.expiresAt <= Date.now() || entry.sessionId !== sessionId) return null;
+    return entry;
+}
+
+async function downloadPostgresExport(req, res, target) {
+    const dump = await createPostgresExport(target.domainName, target.databaseName);
+    let cleaned = false;
+    const cleanup = () => {
+        if(cleaned) return;
+        cleaned = true;
+        removeDumpTempDirectory(dump.directory);
+    };
+    if(res.destroyed) {
+        cleanup();
+        return;
+    }
+    const stream = fs.createReadStream(dump.filePath);
+    stream.on('error', (error) => {
+        console.error(`Could not stream PostgreSQL export ${target.databaseName}: ${error.message}`);
+        cleanup();
+        res.destroy(error);
+    });
+    stream.on('close', cleanup);
+    res.on('close', cleanup);
+    res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': dump.size,
+        'Content-Disposition': `attachment; filename="${dump.downloadName}"`,
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff'
+    });
+    stream.pipe(res);
 }
 
 function httpsGetJson(requestUrl) {
@@ -1127,6 +1581,7 @@ async function withVersionOperation(version, operation) {
 
 async function installVersion(version) {
     if(!isSafeVersion(version)) throw new ApiError(400, `Invalid version: ${version}`);
+    await assertPhpPostgresqlDriver();
 
     return withVersionOperation(version, async () => {
         const destination = adminerPath(version);
@@ -1338,6 +1793,15 @@ async function handleRequest(req, res) {
         return;
     }
 
+    if(req.method === 'GET' && pathname === '/api/postgresql/export') {
+        const downloadAuth = validateCloudPanelSession(req, { requireOrigin: false });
+        if(!downloadAuth.ok) return sendJsonResponse(res, 401, { ok: false, error: downloadAuth.reason });
+        const target = consumeDumpTicket(parsedUrl.query.ticket, downloadAuth.sessionId);
+        if(!target) return sendJsonResponse(res, 403, { ok: false, error: 'Export link expired or already used' });
+        await downloadPostgresExport(req, res, target);
+        return;
+    }
+
     const auth = validateCloudPanelSession(req);
     if(!auth.ok) return sendJsonResponse(res, 401, { ok: false, error: auth.reason });
 
@@ -1349,6 +1813,7 @@ async function handleRequest(req, res) {
     if(req.method === 'GET' && pathname === '/api/postgresql') {
         const domainName = String(parsedUrl.query.domainName || '').trim().toLowerCase();
         const postgresql = await getPostgresqlDatabases(domainName);
+        postgresql.maxImportBytes = MAX_IMPORT_BYTES;
         return sendJsonResponse(res, 200, { ok: true, postgresql });
     }
 
@@ -1387,7 +1852,29 @@ async function handleRequest(req, res) {
     if(req.method === 'POST' && pathname === '/api/postgresql/databases/delete') {
         const body = await readJsonBody(req);
         const domainName = String(body.domainName || '').trim().toLowerCase();
-        const database = await deletePostgresDatabase(domainName, body);
+        const databaseName = String(body.databaseName || '').trim();
+        const database = await withDatabaseOperation(domainName, databaseName,
+            () => deletePostgresDatabase(domainName, body));
+        return sendJsonResponse(res, 200, { ok: true, database });
+    }
+
+    if(req.method === 'POST' && pathname === '/api/postgresql/export-ticket') {
+        const body = await readJsonBody(req);
+        const domainName = String(body.domainName || '').trim().toLowerCase();
+        const databaseName = String(body.databaseName || '').trim();
+        const context = await getPostgresDatabaseForSite(domainName, databaseName);
+        await resolvePostgresTool(context.cluster, 'pg_dump');
+        const ticket = createDumpTicket(auth.sessionId, domainName, databaseName);
+        return sendJsonResponse(res, 201, {
+            ok: true,
+            exportPath: `/api/postgresql/export?ticket=${encodeURIComponent(ticket)}`
+        });
+    }
+
+    if(req.method === 'POST' && pathname === '/api/postgresql/import') {
+        const domainName = String(parsedUrl.query.domainName || '').trim().toLowerCase();
+        const databaseName = String(parsedUrl.query.databaseName || '').trim();
+        const database = await importPostgresDatabase(req, domainName, databaseName);
         return sendJsonResponse(res, 200, { ok: true, database });
     }
 
@@ -1419,6 +1906,7 @@ async function handleRequest(req, res) {
         const compatibleAdminer = listInstalledVersions().some((item) =>
             compareVersionsDesc(item.version, '5.0.0') <= 0);
         if(!compatibleAdminer) throw new ApiError(409, 'Adminer 5.0.0 or newer must be installed');
+        await assertPhpPostgresqlDriver();
         // Resolve once before opening a tab, so missing/mismatched .env files
         // are reported on the CloudPanel page. Credentials are not retained.
         await resolveAdminerConnection(domainName, databaseName);
@@ -1513,7 +2001,7 @@ const server = https.createServer({
     });
 });
 
-server.requestTimeout = Math.max(INSTALL_TIMEOUT + 60000, 60 * 60 * 1000);
+server.requestTimeout = Math.max(INSTALL_TIMEOUT + 60000, DUMP_TIMEOUT + 60000, 60 * 60 * 1000);
 server.headersTimeout = 60000;
 server.listen(PORT, HOST, () => {
     startAdminerPhpServer();

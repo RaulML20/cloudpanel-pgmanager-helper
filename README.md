@@ -60,6 +60,12 @@ keeps the password only in that request's memory. It runs on loopback port
 `7882`; only the authenticated Node HTTPS helper on `7881` proxies it.
 If the server has no `php` command in `PATH`, set `PGMANAGER_PHP_BINARY` to the
 CloudPanel PHP CLI binary before running the installer.
+The installer verifies that this exact binary loads `pgsql` or `pdo_pgsql`. If
+neither driver is available, it installs the matching `phpX.Y-pgsql` package
+through APT and aborts if the module still cannot be loaded.
+When a local PostgreSQL cluster exists, the installer likewise verifies
+`pg_dump`, `pg_restore` and `psql`, installing the cluster's matching
+`postgresql-client-X` package when necessary.
 
 ### Per-database environment variable names
 
@@ -77,6 +83,36 @@ never their values or passwords. The modal's diagnostic is also redacted: it
 reports the selected source and connection metadata, but only says whether a
 password was found.
 
+### Server-side export and import
+
+Each PostgreSQL row also provides **Export** and **Import** actions. Export uses
+the client tools belonging to the detected cluster and produces a compressed
+custom-format dump with `pg_dump --no-owner --no-privileges`. The dump is
+created outside the web root and downloaded only after `pg_dump` succeeds.
+
+Import accepts PostgreSQL custom/tar archives and plain SQL. Archives are
+restored with `pg_restore --clean --if-exists --no-owner --no-privileges`;
+plain files are passed to `psql` with `ON_ERROR_STOP`. The process authenticates
+as the application database user resolved from that database's `.env`, never
+as the PostgreSQL superuser. Its password is supplied only through the child
+process environment and is never placed in arguments, files, responses or
+logs. The connection is tested before the upload, its role must own the target
+database and superuser connections are refused. Existing managed-user
+permissions are refreshed after a successful restore.
+
+PostgreSQL archives can contain executable SQL, so imports must come from a
+trusted source. Plain SQL imports additionally reject psql commands capable of
+running programs or reading/writing server files; only the `\restrict`,
+`\unrestrict` and COPY-data terminator commands emitted by `pg_dump` are
+accepted.
+
+Uploads are streamed to a private temporary directory rather than buffered in
+Node or PHP. `PGMANAGER_MAX_IMPORT_BYTES` defaults to 20 GiB,
+`PGMANAGER_DUMP_TIMEOUT_MS` to four hours and `PGMANAGER_DUMP_TEMP_DIR` to
+`/var/tmp`. Temporary files are deleted after every operation; stale files
+from an interrupted process are removed on the next operation. Only one dump
+operation can run per database at a time.
+
 ## PostgreSQL API
 
 All routes use the same IP, Origin and CloudPanel administrator-session checks
@@ -89,6 +125,9 @@ as the Adminer catalogue.
 | `POST /api/postgresql/mapping` | Save one database's variable-name mapping |
 | `POST /api/postgresql/databases` | Create a database and its first login role |
 | `POST /api/postgresql/databases/delete` | Terminate its active sessions and delete a site database |
+| `POST /api/postgresql/export-ticket` | Issue a session-bound, one-use database export ticket |
+| `GET /api/postgresql/export?ticket=...` | Generate and download a custom PostgreSQL dump |
+| `POST /api/postgresql/import?domainName=...&databaseName=...` | Stream and restore a PostgreSQL dump or plain SQL file |
 | `POST /api/postgresql/users` | Create a login role and grant access to one site database |
 | `POST /api/postgresql/users/update` | Change a managed role's password or permissions |
 | `POST /api/postgresql/users/delete` | Revoke and remove a managed role |
