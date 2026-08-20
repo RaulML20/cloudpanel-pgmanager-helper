@@ -113,6 +113,57 @@ Node or PHP. `PGMANAGER_MAX_IMPORT_BYTES` defaults to 20 GiB,
 from an interrupted process are removed on the next operation. Only one dump
 operation can run per database at a time.
 
+### Daily backups
+
+CloudPanel's remote backup copies each site home, but it only dumps MariaDB.
+The helper can add a daily PostgreSQL dump inside that same home so the
+existing remote backup carries it away without any change to CloudPanel.
+
+Dumps are written to
+`/home/<site-user>/backups/postgresql/<database>/<YYYY-MM-DD>/backup.dump`.
+CloudPanel's own `backups/databases/` directory is treated as off limits and is
+never read, written or deleted; rclone is never invoked, and CloudPanel's
+crons, remotes, filters and retention are never modified. Removing the
+extension leaves CloudPanel working exactly as before.
+
+Each database is dumped with `pg_dump --format=custom --no-owner
+--no-privileges` running as the `postgres` system user, so no password is ever
+placed in arguments, in the environment or in a log. `pg_dump` writes to
+`.backup.dump.tmp` in the destination directory and the file is renamed to
+`backup.dump` only after it exits successfully, so a partial dump is never
+visible as a valid backup. A failing database has its temporary file removed,
+its error logged, and does not stop the remaining databases.
+
+Databases reach the schedule through the site associations the extension
+already maintains: ownership by a site user, or the domain/database registry.
+A database belonging to no site is skipped and logged rather than backed up to
+a shared location.
+
+Retention defaults to seven days and is applied per database, only after that
+day's dump succeeded, so a failed database keeps its older backups. Only dated
+directories directly below that database's own directory can be deleted.
+
+The runner is scheduled from its own
+`/etc/cron.d/cloudpanel-pgmanager-helper-postgresql-backup`, wrapped in
+`flock` so two runs never overlap. The installer reads CloudPanel's cron
+schedule to place the dump two hours before the remote backup, falling back to
+01:00 when it cannot be determined reliably. Writing the cron file is
+idempotent: reinstalling never duplicates an entry.
+
+The schedule, the retention window and the on/off switch are editable from the
+**PostgreSQL Daily Backups** card on the site's databases page, which also
+shows the last result and size per database. Activity is logged to
+`/var/log/cloudpanel-pgmanager-helper/backup.log`.
+
+```bash
+# Run a backup immediately
+flock -n /run/lock/cloudpanel-pgmanager-helper-backup.lock \
+    node /opt/cloudpanel-pgmanager-helper/bin/backup.js
+
+# Inspect the current schedule and last results
+node /opt/cloudpanel-pgmanager-helper/bin/backup.js --status
+```
+
 ## PostgreSQL API
 
 All routes use the same IP, Origin and CloudPanel administrator-session checks
@@ -132,6 +183,8 @@ as the Adminer catalogue.
 | `POST /api/postgresql/users/update` | Change a managed role's password or permissions |
 | `POST /api/postgresql/users/delete` | Revoke and remove a managed role |
 | `POST /api/postgresql/adminer-ticket` | Validate the `.env` and issue a one-use Adminer target ticket |
+| `GET /api/postgresql/backup-settings?domainName=...` | Read the daily backup schedule and the site's last backup results |
+| `POST /api/postgresql/backup-settings` | Save the schedule and retention, rewriting only PgManager's own cron file |
 
 Passwords are delivered to `psql` through standard input and are never placed
 in process arguments or written to the helper's registry.
@@ -169,6 +222,11 @@ curl -fsSL https://raw.githubusercontent.com/RaulML20/cloudpanel-pgmanager-helpe
 PGMANAGER_HELPER_ALLOWED_CLIENT_IPS="YOUR_PUBLIC_IP" bash install.sh
 ```
 
+The installer asks whether to enable the daily PostgreSQL backups. Pass
+`--with-daily-backups` or `--no-daily-backups` to answer in advance; without a
+terminal and without a flag they stay disabled. Re-running the installer never
+overwrites a schedule changed from the panel.
+
 Use `GITHUB_REPO=owner/repository` when publishing it under another repository
 name. The CloudPanel URL is detected automatically; it can be overridden with
 `PGMANAGER_HELPER_ALLOWED_ORIGIN` and `PGMANAGER_HELPER_PUBLIC_HOST`.
@@ -185,3 +243,8 @@ bash /opt/cloudpanel-pgmanager-helper/uninstall.sh --purge
 
 The normal mode keeps installed Adminer versions and the GitHub catalogue
 cache for a later reinstall. `--purge` removes those as well.
+
+Both modes remove only the cron entry, lock and log the extension created, and
+leave CloudPanel's crons untouched. Existing PostgreSQL dumps inside the site
+homes are never deleted automatically; `--purge` offers to remove them only
+after an explicit confirmation at the terminal.

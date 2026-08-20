@@ -734,6 +734,164 @@
     return card;
   }
 
+  function padTwo(value) {
+    return (value < 10 ? '0' : '') + value;
+  }
+
+  function labelledField(labelText, control) {
+    var wrapper = document.createElement('div');
+    wrapper.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+    var label = document.createElement('label');
+    label.className = 'form-label';
+    label.style.marginBottom = '0';
+    label.textContent = labelText;
+    wrapper.appendChild(label);
+    wrapper.appendChild(control);
+    return wrapper;
+  }
+
+  /*
+   * Daily dumps land in the site home, so CloudPanel's existing remote backup
+   * carries them off untouched. This card only edits PgManager's own schedule;
+   * CloudPanel's backup configuration is never written from here.
+   */
+  function buildPostgresBackupCard(domainName, databases) {
+    var card = document.createElement('div');
+    card.className = 'card card-table';
+    card.id = 'pgmanager-postgresql-backups';
+
+    var header = document.createElement('div');
+    header.className = 'card-header d-flex justify-content-between';
+    var heading = document.createElement('div');
+    heading.textContent = 'PostgreSQL Daily Backups';
+    header.appendChild(heading);
+    card.appendChild(header);
+
+    var body = document.createElement('div');
+    body.className = 'card-body';
+    card.appendChild(body);
+
+    var hint = document.createElement('p');
+    hint.className = 'text-muted';
+    hint.style.cssText = 'margin-bottom:16px';
+    body.appendChild(hint);
+
+    var controls = document.createElement('div');
+    controls.style.cssText = 'display:flex;flex-wrap:wrap;align-items:flex-end;gap:16px';
+    body.appendChild(controls);
+
+    var enabled = document.createElement('input');
+    enabled.type = 'checkbox';
+    enabled.className = 'form-check-input';
+    var enabledWrapper = document.createElement('div');
+    enabledWrapper.className = 'form-check';
+    enabledWrapper.style.cssText = 'display:flex;align-items:center;gap:8px;margin:0 0 8px 0';
+    var enabledLabel = document.createElement('label');
+    enabledLabel.className = 'form-check-label';
+    enabledLabel.textContent = 'Enabled';
+    enabledWrapper.appendChild(enabled);
+    enabledWrapper.appendChild(enabledLabel);
+    controls.appendChild(enabledWrapper);
+
+    var time = document.createElement('input');
+    time.type = 'time';
+    time.className = 'form-control';
+    time.style.width = '140px';
+    controls.appendChild(labelledField('Runs daily at', time));
+
+    var retention = document.createElement('input');
+    retention.type = 'number';
+    retention.className = 'form-control';
+    retention.min = '1';
+    retention.max = '365';
+    retention.style.width = '120px';
+    controls.appendChild(labelledField('Keep for (days)', retention));
+
+    var save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn btn-primary';
+    save.textContent = 'Save';
+    controls.appendChild(save);
+
+    var status = document.createElement('div');
+    status.className = 'text-muted';
+    status.style.cssText = 'margin-top:12px';
+    body.appendChild(status);
+
+    var runsBody = document.createElement('div');
+    runsBody.className = 'card-body card-body-no-padding';
+    card.appendChild(runsBody);
+
+    function renderRuns(lastRun) {
+      runsBody.textContent = '';
+      if (!databases.length) return;
+
+      var table = document.createElement('table');
+      table.className = 'table';
+      table.innerHTML = '<thead><tr><th>Database</th><th width="220">Last backup</th><th width="140">Result</th><th width="140">Size</th></tr></thead>';
+      var tableBody = document.createElement('tbody');
+
+      databases.forEach(function (database) {
+        var name = database.name || '';
+        var entry = lastRun && lastRun[name] ? lastRun[name] : null;
+        var row = document.createElement('tr');
+        appendTextCell(row, name);
+        appendTextCell(row, entry && entry.at ? new Date(entry.at).toLocaleString() : 'Never');
+        appendTextCell(row, entry ? (entry.ok ? 'OK' : (entry.error || 'Failed')) : '-');
+        appendTextCell(row, entry && entry.ok ? formatBytes(entry.size) : '-');
+        tableBody.appendChild(row);
+      });
+
+      table.appendChild(tableBody);
+      runsBody.appendChild(table);
+    }
+
+    function apply(payload) {
+      var settings = payload.settings || {};
+      enabled.checked = settings.enabled === true;
+      time.value = padTwo(settings.hour || 0) + ':' + padTwo(settings.minute || 0);
+      retention.value = String(settings.retentionDays || 7);
+      hint.textContent = 'Dumps are written to ' + (payload.backupDirectory || '') +
+        ' and are included in the CloudPanel remote backup of the site home.';
+      status.textContent = settings.enabled
+        ? 'Scheduled daily at ' + padTwo(settings.hour) + ':' + padTwo(settings.minute) + '.'
+        : 'Daily backups are currently disabled.';
+      renderRuns(payload.lastRun);
+    }
+
+    save.addEventListener('click', function () {
+      var parts = String(time.value || '').split(':');
+      save.disabled = true;
+      save.textContent = 'Saving...';
+
+      api('/api/postgresql/backup-settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          domainName: domainName,
+          enabled: enabled.checked,
+          hour: Number(parts[0]),
+          minute: Number(parts[1]),
+          retentionDays: Number(retention.value)
+        })
+      }).then(function (payload) {
+        apply(payload);
+      }).catch(function (error) {
+        showPostgresError(card, error.message);
+      }).then(function () {
+        save.disabled = false;
+        save.textContent = 'Save';
+      });
+    });
+
+    api('/api/postgresql/backup-settings?domainName=' + encodeURIComponent(domainName))
+      .then(apply)
+      .catch(function (error) {
+        showPostgresError(card, error.message);
+      });
+
+    return card;
+  }
+
   function start() {
     var domainName = getDomainNameFromPath();
     if (!domainName || document.getElementById('pgmanager-postgresql-databases')) return;
@@ -753,14 +911,21 @@
         mariaDbCard.parentNode.insertBefore(postgresCard, mariaDbCard.nextSibling);
 
         var databases = Array.isArray(postgresql.databases) ? postgresql.databases : [];
+        var backupCard = null;
+        if (postgresql.available && databases.length) {
+          backupCard = buildPostgresBackupCard(domainName, databases);
+          postgresCard.parentNode.insertBefore(backupCard, postgresCard.nextSibling);
+        }
+
         if (databases.length) {
+          var anchorCard = backupCard || postgresCard;
           var nativeUsersCard = findMariaDbUsersCard();
           var postgresUsersCard = buildPostgresUsersCard(postgresql, domainName);
           if (nativeUsersCard) {
             replaceFirstHeadingText(nativeUsersCard, 'MariaDB Database Users');
             nativeUsersCard.parentNode.insertBefore(postgresUsersCard, nativeUsersCard.nextSibling);
           } else {
-            postgresCard.parentNode.insertBefore(postgresUsersCard, postgresCard.nextSibling);
+            anchorCard.parentNode.insertBefore(postgresUsersCard, anchorCard.nextSibling);
           }
 
           if (hasMariaDbDatabases && nativeUsersCard) {

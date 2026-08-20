@@ -23,6 +23,28 @@ PGMANAGER_PHP_BINARY="${PGMANAGER_PHP_BINARY:-php}"
 PGMANAGER_DUMP_TEMP_DIR="${PGMANAGER_DUMP_TEMP_DIR:-/var/tmp}"
 PGMANAGER_DUMP_TIMEOUT_MS="${PGMANAGER_DUMP_TIMEOUT_MS:-14400000}"
 PGMANAGER_MAX_IMPORT_BYTES="${PGMANAGER_MAX_IMPORT_BYTES:-21474836480}"
+PGMANAGER_BACKUP_TIMEOUT_MS="${PGMANAGER_BACKUP_TIMEOUT_MS:-14400000}"
+
+# Empty means "not decided yet": the installer asks when it has a terminal and
+# otherwise leaves the daily PostgreSQL backups switched off.
+PGMANAGER_DAILY_BACKUPS="${PGMANAGER_DAILY_BACKUPS:-}"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --with-daily-backups) PGMANAGER_DAILY_BACKUPS=1 ;;
+        --no-daily-backups) PGMANAGER_DAILY_BACKUPS=0 ;;
+        -h|--help)
+            echo "Usage: install.sh [--with-daily-backups|--no-daily-backups]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Usage: install.sh [--with-daily-backups|--no-daily-backups]" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 CLOUDPANEL_ROOT="${CLOUDPANEL_ROOT:-/home/clp/htdocs/app/files}"
 CLOUDPANEL_TEMPLATES_DIR="${CLOUDPANEL_TEMPLATES_DIR:-$CLOUDPANEL_ROOT/templates}"
@@ -337,6 +359,7 @@ PGMANAGER_PHP_BINARY=$PGMANAGER_PHP_BINARY
 PGMANAGER_DUMP_TEMP_DIR=$PGMANAGER_DUMP_TEMP_DIR
 PGMANAGER_DUMP_TIMEOUT_MS=$PGMANAGER_DUMP_TIMEOUT_MS
 PGMANAGER_MAX_IMPORT_BYTES=$PGMANAGER_MAX_IMPORT_BYTES
+PGMANAGER_BACKUP_TIMEOUT_MS=$PGMANAGER_BACKUP_TIMEOUT_MS
 EOF
     chmod 0600 "$INSTALL_DIR/.env"
 }
@@ -434,6 +457,52 @@ configure_pm2_cron() {
     rm -f "$cron_file"
 }
 
+# Daily PostgreSQL backups are optional and entirely self-contained: they add
+# one /etc/cron.d file of their own and write only below
+# /home/<site-user>/backups/postgresql/. CloudPanel's crons, its rclone setup
+# and its backups/databases directory are never read for anything but the
+# schedule, and never modified.
+configure_postgresql_backup() {
+    local answer suggested
+
+    if [ -z "$PGMANAGER_DAILY_BACKUPS" ]; then
+        if [ -t 0 ]; then
+            # Read-only: this only parses CloudPanel's cron schedule to propose
+            # an hour, it never writes to it.
+            suggested="$(node -e "console.log(require('$INSTALL_DIR/lib/backup-config').suggestBackupHour())" 2>/dev/null || echo 1)"
+            printf '\n[%s] Daily PostgreSQL backups\n' "$APP_NAME"
+            echo "  Dumps every managed PostgreSQL database to"
+            echo "  /home/<site-user>/backups/postgresql/<database>/<date>/backup.dump so that"
+            echo "  the CloudPanel remote backup picks them up with the rest of the site home."
+            echo "  Proposed schedule: ${suggested}:00 daily, keeping 7 days. Both are"
+            echo "  configurable later from the site's databases page."
+            read -r -p "  Enable daily PostgreSQL backups now? [y/N] " answer || answer=""
+            case "$answer" in
+                [yY]|[yY][eE][sS]) PGMANAGER_DAILY_BACKUPS=1 ;;
+                *) PGMANAGER_DAILY_BACKUPS=0 ;;
+            esac
+        else
+            PGMANAGER_DAILY_BACKUPS=0
+        fi
+    fi
+
+    chmod 0755 "$INSTALL_DIR/bin/backup.js"
+
+    if [ "$PGMANAGER_DAILY_BACKUPS" -ne 1 ]; then
+        log "Daily PostgreSQL backups are disabled"
+        node "$INSTALL_DIR/bin/backup.js" --disable >/dev/null
+        return
+    fi
+
+    command -v flock >/dev/null 2>&1 || {
+        echo "flock is required for the daily PostgreSQL backups; install util-linux." >&2
+        exit 1
+    }
+
+    log "Enabling daily PostgreSQL backups"
+    node "$INSTALL_DIR/bin/backup.js" --enable >/dev/null
+}
+
 restart_cloudpanel() {
     log "Clearing CloudPanel cache and restarting panel services"
     if [ -d "$CLOUDPANEL_CACHE_DIR" ]; then
@@ -467,9 +536,14 @@ install_templates
 configure_firewall
 start_pm2
 configure_pm2_cron
+configure_postgresql_backup
 restart_cloudpanel
 
 log "Installation completed"
 echo "Adminer helper API: https://$(detect_public_host):$PGMANAGER_HELPER_PORT"
 echo "Adminer versions directory: $ADMINER_ROOT"
 echo "Open the API URL once and accept its self-signed certificate."
+if [ "${PGMANAGER_DAILY_BACKUPS:-0}" -eq 1 ]; then
+    echo "Daily PostgreSQL backups: /home/<site-user>/backups/postgresql/<database>/<date>/backup.dump"
+    echo "Backup log: /var/log/cloudpanel-pgmanager-helper/backup.log"
+fi
