@@ -152,9 +152,14 @@ idempotent: reinstalling never duplicates an entry.
 
 The schedule and the retention window apply to every managed database on the
 instance, so they are edited from the **PostgreSQL Daily Backups** card in
-**Admin Area > Instance > Services**, next to the Adminer catalogue. The same
-card lists the last result and size of every database across all sites.
+**Admin Area > Backups**, below CloudPanel's own Remote Backup settings. The
+same card lists the last result and size of every database across all sites.
 Activity is logged to `/var/log/cloudpanel-pgmanager-helper/backup.log`.
+
+That card is the only optional patch: if the Remote Backup template cannot be
+located, the installer logs it and continues, and the schedule stays reachable
+through `bin/backup.js`. Set `CLOUDPANEL_TPL_REMOTE_BACKUP` to point at the
+template explicitly.
 
 ```bash
 # Run a backup immediately
@@ -198,9 +203,12 @@ form, the same **Add Database User** action opens a PostgreSQL modal instead.
 
 ## Safe template integration
 
-The installer never replaces a CloudPanel template. It locates the current
-`services.html.twig` and injects `blocks/instance-services.html` immediately
-before its final Twig `endblock`. The injected region has unique markers:
+The installer never replaces a CloudPanel template. It locates each template by
+a signature of its own markup and injects the matching file from `blocks/`
+immediately before that template's final Twig `endblock`: the site databases
+page, the two database forms, `services.html.twig` for the Adminer catalogue
+and the Remote Backup page for the daily backup schedule. The injected region
+has unique markers:
 
 ```twig
 {# BEGIN cloudpanel-pgmanager-helper #}

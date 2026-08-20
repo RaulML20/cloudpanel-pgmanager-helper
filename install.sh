@@ -55,6 +55,7 @@ CLOUDPANEL_TPL_SERVICES="${CLOUDPANEL_TPL_SERVICES:-}"
 CLOUDPANEL_TPL_DATABASES="${CLOUDPANEL_TPL_DATABASES:-}"
 CLOUDPANEL_TPL_NEW_DATABASE="${CLOUDPANEL_TPL_NEW_DATABASE:-}"
 CLOUDPANEL_TPL_NEW_DATABASE_USER="${CLOUDPANEL_TPL_NEW_DATABASE_USER:-}"
+CLOUDPANEL_TPL_REMOTE_BACKUP="${CLOUDPANEL_TPL_REMOTE_BACKUP:-}"
 BACKUP_SUFFIX=".cloudpanel-pgmanager-helper.bak"
 BLOCK_MARKER="BEGIN cloudpanel-pgmanager-helper"
 APT_UPDATED=0
@@ -407,6 +408,19 @@ install_templates() {
     inject_block "$databases_template" "$INSTALL_DIR/blocks/site-databases.html"
     inject_block "$new_database_template" "$INSTALL_DIR/blocks/new-database.html"
     inject_block "$new_database_user_template" "$INSTALL_DIR/blocks/new-database-user.html"
+
+    # The Remote Backup page only carries the optional daily-backup schedule, so
+    # a CloudPanel build without it must not block the rest of the installation.
+    local remote_backup_template
+    remote_backup_template="$(locate_template 'index.html.twig' 'remote-backups-container' "$CLOUDPANEL_TPL_REMOTE_BACKUP" 2>/dev/null || true)"
+
+    if [ -n "$remote_backup_template" ]; then
+        inject_block "$remote_backup_template" "$INSTALL_DIR/blocks/admin-backups.html"
+    else
+        log "Remote Backup template not located; skipping that card"
+        echo "  Set CLOUDPANEL_TPL_REMOTE_BACKUP to patch it. The daily backup schedule"
+        echo "  stays available through: node $INSTALL_DIR/bin/backup.js --status"
+    fi
 }
 
 configure_firewall() {
