@@ -5,6 +5,28 @@
   var adminerHelperPort = '__PGMANAGER_HELPER_PORT__';
   var adminerApiBase = 'https://' + window.location.hostname + ':' + adminerHelperPort;
 
+  function api(path, options) {
+    options = options || {};
+    options.credentials = 'include';
+    if (options.body) options.headers = { 'Content-Type': 'application/json' };
+
+    return fetch(adminerApiBase + path, options).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload && payload.error ? payload.error : 'Request failed');
+        }
+        return payload;
+      });
+    });
+  }
+
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes)) return '-';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+
   function start() {
     var container = document.querySelector('.instance-services-container');
     if (!container || document.getElementById('adminer-versions-card')) return;
@@ -37,21 +59,6 @@
     var busy = false;
     var visibleAvailableCount = 5;
 
-    function api(path, options) {
-      options = options || {};
-      options.credentials = 'include';
-      if (options.body) options.headers = { 'Content-Type': 'application/json' };
-
-      return fetch(adminerApiBase + path, options).then(function (response) {
-        return response.json().then(function (payload) {
-          if (!response.ok || !payload.ok) {
-            throw new Error(payload && payload.error ? payload.error : 'Request failed');
-          }
-          return payload;
-        });
-      });
-    }
-
     function showError(message) {
       errorBox.textContent = message;
       errorBox.style.display = '';
@@ -73,13 +80,6 @@
       link.textContent = label;
       link.addEventListener('click', handler);
       return link;
-    }
-
-    function formatBytes(bytes) {
-      if (!Number.isFinite(bytes)) return '-';
-      if (bytes < 1024) return bytes + ' B';
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KiB';
-      return (bytes / (1024 * 1024)).toFixed(1) + ' MiB';
     }
 
     function buildRow(item) {
@@ -178,8 +178,159 @@
     load();
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
-  else start();
+  function padTwo(value) {
+    return (Number(value) < 10 ? '0' : '') + Number(value);
+  }
+
+  /*
+   * The daily PostgreSQL backup schedule applies to every site on this
+   * instance, so it belongs here rather than on a single site's page. The card
+   * only edits PgManager's own cron file; CloudPanel's backup configuration is
+   * never written from here.
+   */
+  function startPostgresBackups() {
+    var container = document.querySelector('.instance-services-container');
+    if (!container || document.getElementById('pgmanager-backups-card')) return;
+
+    var card = document.createElement('div');
+    card.className = 'card card-table mt-4';
+    card.id = 'pgmanager-backups-card';
+    card.innerHTML =
+      '<div class="card-header d-flex justify-content-between">' +
+        '<span>PostgreSQL Daily Backups</span>' +
+      '</div>' +
+      '<div class="card-body">' +
+        '<div id="pgmanager-backups-error" class="alert alert-danger" style="display:none;white-space:pre-wrap"></div>' +
+        '<p class="text-muted" id="pgmanager-backups-hint">Loading the PostgreSQL backup schedule...</p>' +
+        '<div id="pgmanager-backups-controls" style="display:none;flex-wrap:wrap;align-items:flex-end;gap:16px">' +
+          '<div class="form-check" style="display:flex;align-items:center;gap:8px;margin:0 0 8px 0">' +
+            '<input type="checkbox" class="form-check-input" id="pgmanager-backups-enabled">' +
+            '<label class="form-check-label" for="pgmanager-backups-enabled">Enabled</label>' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:4px">' +
+            '<label class="form-label" style="margin-bottom:0" for="pgmanager-backups-time">Runs daily at</label>' +
+            '<input type="time" class="form-control" id="pgmanager-backups-time" style="width:140px">' +
+          '</div>' +
+          '<div style="display:flex;flex-direction:column;gap:4px">' +
+            '<label class="form-label" style="margin-bottom:0" for="pgmanager-backups-retention">Keep for (days)</label>' +
+            '<input type="number" min="1" max="365" class="form-control" id="pgmanager-backups-retention" style="width:120px">' +
+          '</div>' +
+          '<button type="button" class="btn btn-blue" id="pgmanager-backups-save">Save</button>' +
+        '</div>' +
+        '<div class="text-muted" id="pgmanager-backups-status" style="margin-top:12px"></div>' +
+      '</div>' +
+      '<div class="card-body card-body-no-padding" id="pgmanager-backups-runs"></div>';
+    container.appendChild(card);
+
+    var errorBox = document.getElementById('pgmanager-backups-error');
+    var hint = document.getElementById('pgmanager-backups-hint');
+    var controls = document.getElementById('pgmanager-backups-controls');
+    var enabled = document.getElementById('pgmanager-backups-enabled');
+    var time = document.getElementById('pgmanager-backups-time');
+    var retention = document.getElementById('pgmanager-backups-retention');
+    var save = document.getElementById('pgmanager-backups-save');
+    var status = document.getElementById('pgmanager-backups-status');
+    var runs = document.getElementById('pgmanager-backups-runs');
+
+    function showBackupError(message) {
+      errorBox.textContent = message;
+      errorBox.style.display = '';
+    }
+
+    function renderRuns(lastRun) {
+      runs.textContent = '';
+      if (!lastRun || !lastRun.length) return;
+
+      var table = document.createElement('table');
+      table.className = 'table table-users';
+      table.innerHTML = '<thead><tr>' +
+        '<th>Site</th><th>Database</th><th width="200">Last backup</th>' +
+        '<th width="120">Result</th><th width="120">Size</th>' +
+        '</tr></thead>';
+      var tbody = document.createElement('tbody');
+
+      lastRun.forEach(function (entry) {
+        var row = document.createElement('tr');
+        [
+          entry.domainName || '-',
+          entry.databaseName || '-',
+          entry.at ? new Date(entry.at).toLocaleString() : 'Never'
+        ].forEach(function (value) {
+          var cell = document.createElement('td');
+          cell.textContent = value;
+          row.appendChild(cell);
+        });
+
+        var resultCell = document.createElement('td');
+        var badge = document.createElement('span');
+        badge.className = 'label-outline ' + (entry.ok ? 'label-outline-green' : 'label-outline-orange');
+        badge.textContent = entry.ok ? 'OK' : 'Failed';
+        if (!entry.ok && entry.error) resultCell.title = entry.error;
+        resultCell.appendChild(badge);
+        row.appendChild(resultCell);
+
+        var sizeCell = document.createElement('td');
+        sizeCell.textContent = entry.ok ? formatBytes(entry.size) : '-';
+        row.appendChild(sizeCell);
+
+        tbody.appendChild(row);
+      });
+
+      table.appendChild(tbody);
+      runs.appendChild(table);
+    }
+
+    function apply(payload) {
+      var settings = payload.settings || {};
+      controls.style.display = 'flex';
+      enabled.checked = settings.enabled === true;
+      time.value = padTwo(settings.hour || 0) + ':' + padTwo(settings.minute || 0);
+      retention.value = String(settings.retentionDays || 7);
+      hint.textContent = 'Every PostgreSQL database managed for a site is dumped to ' +
+        (payload.backupDirectory || '') + ', so the CloudPanel remote backup of that site home ' +
+        'includes it. This schedule applies to all sites on this instance.';
+      status.textContent = settings.enabled
+        ? 'Scheduled daily at ' + padTwo(settings.hour) + ':' + padTwo(settings.minute) +
+          ', keeping ' + settings.retentionDays + ' day(s). Log: ' + (payload.logFile || '')
+        : 'Daily PostgreSQL backups are currently disabled.';
+      renderRuns(payload.lastRun);
+    }
+
+    save.addEventListener('click', function () {
+      var parts = String(time.value || '').split(':');
+      errorBox.style.display = 'none';
+      save.disabled = true;
+      save.textContent = 'Saving...';
+
+      api('/api/postgresql/backup-settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          enabled: enabled.checked,
+          hour: Number(parts[0]),
+          minute: Number(parts[1]),
+          retentionDays: Number(retention.value)
+        })
+      }).then(apply).catch(function (error) {
+        showBackupError(error.message);
+      }).then(function () {
+        save.disabled = false;
+        save.textContent = 'Save';
+      });
+    });
+
+    api('/api/postgresql/backup-settings').then(apply).catch(function (error) {
+      hint.textContent = 'Could not load the PostgreSQL backup schedule.';
+      showBackupError(error.message + ' - Is the PgManager helper service running?');
+    });
+  }
+
+  function boot() {
+    start();
+    startPostgresBackups();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();
 </script>
 {# END cloudpanel-pgmanager-helper #}

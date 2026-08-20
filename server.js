@@ -1562,17 +1562,41 @@ async function handleAdminerRequest(req, res) {
  * home and its own /etc/cron.d file; nothing here reads or writes CloudPanel's
  * schedule, its rclone configuration or its backups/databases directory.
  */
-function buildBackupSettingsPayload(domainName) {
+/*
+ * The schedule and retention apply to every managed database on the instance,
+ * so the payload is instance-wide: one set of settings plus the last result of
+ * every database, whichever site it belongs to.
+ */
+function buildBackupSettingsPayload() {
     const state = backupSettings.loadState();
-    const domainState = (domainName && state[domainName] && typeof state[domainName] === 'object')
-        ? state[domainName]
-        : {};
+    const lastRun = [];
+
+    for(const [domainName, databases] of Object.entries(state)) {
+        if(!isSafeDomainName(domainName) || !databases || typeof databases !== 'object') continue;
+
+        for(const [databaseName, entry] of Object.entries(databases)) {
+            if(!isSafePostgresIdentifier(databaseName) || !entry || typeof entry !== 'object') continue;
+            lastRun.push({
+                domainName,
+                databaseName,
+                siteUser: typeof entry.siteUser === 'string' ? entry.siteUser : null,
+                at: typeof entry.at === 'string' ? entry.at : null,
+                ok: entry.ok === true,
+                size: Number.isFinite(entry.size) ? entry.size : null,
+                error: typeof entry.error === 'string' ? entry.error : null
+            });
+        }
+    }
+
+    lastRun.sort((a, b) => a.domainName.localeCompare(b.domainName)
+        || a.databaseName.localeCompare(b.databaseName));
 
     return {
         settings: backupSettings.loadSettings(),
         suggestedHour: backupConfig.suggestBackupHour(),
         backupDirectory: `/home/<site-user>/backups/${backupConfig.BACKUP_ROOT_NAME}/<database>/<date>/backup.dump`,
-        lastRun: domainState
+        logFile: backupConfig.LOG_FILE,
+        lastRun
     };
 }
 
@@ -1697,17 +1721,13 @@ async function handleRequest(req, res) {
     }
 
     if(req.method === 'GET' && pathname === '/api/postgresql/backup-settings') {
-        const domainName = String(parsedUrl.query.domainName || '').trim().toLowerCase();
-        if(domainName && !isSafeDomainName(domainName)) throw new ApiError(400, 'Invalid domain name');
-        return sendJsonResponse(res, 200, { ok: true, ...buildBackupSettingsPayload(domainName) });
+        return sendJsonResponse(res, 200, { ok: true, ...buildBackupSettingsPayload() });
     }
 
     if(req.method === 'POST' && pathname === '/api/postgresql/backup-settings') {
         const body = await readJsonBody(req);
-        const domainName = String(body.domainName || '').trim().toLowerCase();
-        if(domainName && !isSafeDomainName(domainName)) throw new ApiError(400, 'Invalid domain name');
         savePostgresBackupSettings(body);
-        return sendJsonResponse(res, 200, { ok: true, ...buildBackupSettingsPayload(domainName) });
+        return sendJsonResponse(res, 200, { ok: true, ...buildBackupSettingsPayload() });
     }
 
     if(req.method === 'POST' && pathname === '/api/postgresql/databases') {

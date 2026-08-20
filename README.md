@@ -150,10 +150,11 @@ schedule to place the dump two hours before the remote backup, falling back to
 01:00 when it cannot be determined reliably. Writing the cron file is
 idempotent: reinstalling never duplicates an entry.
 
-The schedule, the retention window and the on/off switch are editable from the
-**PostgreSQL Daily Backups** card on the site's databases page, which also
-shows the last result and size per database. Activity is logged to
-`/var/log/cloudpanel-pgmanager-helper/backup.log`.
+The schedule and the retention window apply to every managed database on the
+instance, so they are edited from the **PostgreSQL Daily Backups** card in
+**Admin Area > Instance > Services**, next to the Adminer catalogue. The same
+card lists the last result and size of every database across all sites.
+Activity is logged to `/var/log/cloudpanel-pgmanager-helper/backup.log`.
 
 ```bash
 # Run a backup immediately
@@ -183,7 +184,7 @@ as the Adminer catalogue.
 | `POST /api/postgresql/users/update` | Change a managed role's password or permissions |
 | `POST /api/postgresql/users/delete` | Revoke and remove a managed role |
 | `POST /api/postgresql/adminer-ticket` | Validate the `.env` and issue a one-use Adminer target ticket |
-| `GET /api/postgresql/backup-settings?domainName=...` | Read the daily backup schedule and the site's last backup results |
+| `GET /api/postgresql/backup-settings` | Read the instance-wide daily backup schedule and the last result of every database |
 | `POST /api/postgresql/backup-settings` | Save the schedule and retention, rewriting only PgManager's own cron file |
 
 Passwords are delivered to `psql` through standard input and are never placed
